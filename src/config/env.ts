@@ -1,0 +1,23 @@
+import 'dotenv/config';
+import { z } from 'zod';
+
+const EnvSchema = z.object({
+  PORT: z.coerce.number().default(4000),
+  HOST: z.string().default('0.0.0.0'),
+  JWT_SECRET: z.string().min(8, 'JWT_SECRET must be set'),
+  ADMIN_SYNC_SECRET: z.string().min(8, 'ADMIN_SYNC_SECRET must be set'),
+  CONN_STRING_SECRET: z
+    .string()
+    .length(64, 'CONN_STRING_SECRET must be a 64-char hex string (32 bytes)'),
+  DB_FILE: z.string().default('./data/metadata.json'),
+});
+
+const parsed = EnvSchema.safeParse(process.env);
+
+if (!parsed.success) {
+  console.error('❌ Invalid environment configuration:');
+  console.error(parsed.error.flatten().fieldErrors);
+  process.exit(1);
+}
+
+export const env = parsed.data;
