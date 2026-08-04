@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { getDb } from '../../store/db';
-import type { TenantRecord, EndpointConfig } from '../../types/contracts';
+import type { TenantRecord, EndpointConfig, TenantConnectionRecord } from '../../types/contracts';
 
 export const tenantRepository = {
   async findBySlug(slug: string): Promise<TenantRecord | undefined> {
@@ -29,6 +29,15 @@ export const tenantRepository = {
     db.data.tenants.push(tenant);
     await db.write();
     return tenant;
+  },
+
+  async replaceConnections(tenantId: string, connections: TenantConnectionRecord[]) {
+    const db = await getDb();
+    const tenant = db.data.tenants.find((t) => t.id === tenantId);
+    if (!tenant) return;
+    tenant.connections = connections;
+    tenant.updatedAt = new Date().toISOString();
+    await db.write();
   },
 
   async updateConnection(tenantId: string, enc: string, iv: string) {

@@ -6,18 +6,17 @@ class RouteRegistry {
   private routes = new Map<RouteKey, EndpointConfig>();
   private byTenant = new Map<string, Set<RouteKey>>();
 
-  private key(tenantSlug: string, method: string, pathTemplate: string): RouteKey {
-    return `${tenantSlug}:${method.toUpperCase()}:${pathTemplate}`;
+  private key(tenantSlug: string, method: string, pathTemplate: string, dbKey?: string): RouteKey {
+    return `${tenantSlug}:${dbKey || 'default'}:${method.toUpperCase()}:${pathTemplate}`;
   }
 
   upsert(tenantSlug: string, endpoint: EndpointConfig) {
-    const k = this.key(tenantSlug, endpoint.method, endpoint.pathTemplate);
+    const k = this.key(tenantSlug, endpoint.method, endpoint.pathTemplate, endpoint.dbKey);
     this.routes.set(k, endpoint);
     if (!this.byTenant.has(tenantSlug)) this.byTenant.set(tenantSlug, new Set());
     this.byTenant.get(tenantSlug)!.add(k);
   }
 
-  /** Called by the sync endpoint — full replace = instant hot reload, zero downtime */
   replaceTenantRoutes(tenantSlug: string, endpoints: EndpointConfig[]) {
     const existing = this.byTenant.get(tenantSlug);
     if (existing) existing.forEach((k) => this.routes.delete(k));
@@ -28,7 +27,8 @@ class RouteRegistry {
   resolve(
     tenantSlug: string,
     method: string,
-    pathname: string
+    pathname: string,
+    dbKey?: string
   ): { endpoint: EndpointConfig; params: Record<string, string> } | null {
     const tenantKeys = this.byTenant.get(tenantSlug);
     if (!tenantKeys) return null;
@@ -36,6 +36,12 @@ class RouteRegistry {
     for (const k of tenantKeys) {
       const endpoint = this.routes.get(k)!;
       if (endpoint.method.toUpperCase() !== method.toUpperCase()) continue;
+      // Match dbKey: endpoint.dbKey optional → accepts any; if set must match
+      if (dbKey && endpoint.dbKey && endpoint.dbKey !== dbKey) continue;
+      if (!dbKey && endpoint.dbKey && endpoint.dbKey !== 'default' && endpoint.dbKey !== 'primary') {
+        // request without dbKey only matches primary/default endpoints
+        continue;
+      }
       const match = matchTemplate(endpoint.pathTemplate, pathname);
       if (match) return { endpoint, params: match };
     }
@@ -43,7 +49,7 @@ class RouteRegistry {
   }
 
   debugAll() {
-    return Array.from(this.routes.values());
+    return Array.from(this.routes.entries()).map(([k, v]) => ({ key: k, ...v }));
   }
 }
 
