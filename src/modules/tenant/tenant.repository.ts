@@ -72,4 +72,13 @@ export const tenantRepository = {
     const db = await getDb();
     return db.data.tenants;
   },
+
+  /**
+   * Ähli saklanan endpoint-ler.
+   * app.ts bootstrapRoutes() bu bilen routeRegistry-ni doldurýar.
+   */
+  async listAllEndpoints(): Promise<(EndpointConfig & { id?: string; tenantId?: string })[]> {
+    const db = await getDb();
+    return db.data.endpoints ?? [];
+  },
 };
