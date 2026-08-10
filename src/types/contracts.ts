@@ -63,3 +63,61 @@ export interface ApiKeyRecord {
   revoked: boolean;
   createdAt: string;
 }
+
+/** Staff synced from Electron admin apps → used by BI Platform login */
+export type StaffRole = 'admin' | 'editor' | 'viewer';
+
+export interface StaffRecord {
+  id: string;
+  /** tenant slug this staff belongs to (primary company) */
+  tenantSlug: string;
+  /** additional tenant slugs the staff can access */
+  tenantSlugs: string[];
+  fullName: string;
+  username: string;
+  /** Electron scrypt format: "saltHex:hashHex" */
+  passwordHash: string;
+  /** Optional AES-encrypted plain password for admin UI reveal */
+  passwordEnc?: string;
+  role: StaffRole;
+  phone?: string;
+  email?: string;
+  active: boolean;
+  updatedAt: string;
+  createdAt: string;
+}
+
+export type RegistrationStatus = 'pending' | 'approved' | 'rejected';
+
+/** Registration created by BI Platform, reviewed by Electron (or BI admin) */
+export interface RegistrationRecord {
+  id: string;
+  tenantSlug: string;
+  tenantName: string;
+  firstName: string;
+  lastName: string;
+  phone: string;
+  email: string;
+  username: string;
+  /** bcrypt or scrypt hash from BI */
+  passwordHash: string;
+  status: RegistrationStatus;
+  requestedRole?: StaffRole;
+  reviewedBy?: string;
+  reviewedAt?: string;
+  note?: string;
+  /** set when an Electron instance first fetches this registration */
+  deliveredAt?: string;
+  createdAt: string;
+}
+
+/** Simple user-facing notification (approve/reject) */
+export interface UserNotification {
+  id: string;
+  username: string;
+  type: 'registration_approved' | 'registration_rejected';
+  title: string;
+  message: string;
+  read: boolean;
+  createdAt: string;
+}

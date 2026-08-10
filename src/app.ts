@@ -4,6 +4,7 @@ import { authPlugin } from './plugins/auth.plugin';
 import { adminRoutes } from './modules/admin/admin.routes';
 import { healthRoutes } from './modules/health/health.routes';
 import { registerDynamicRouter } from './core/router/dynamicRouter';
+import { registerAvatarRoutes } from './modules/avatar/avatar.routes';
 import { routeRegistry } from './core/router/routeRegistry';
 import { tenantRepository } from './modules/tenant/tenant.repository';
 
@@ -64,6 +65,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(authPlugin);
   await app.register(healthRoutes);
   await app.register(adminRoutes);
+  await registerAvatarRoutes(app);
   await registerDynamicRouter(app);
 
   // Diskden route-lary ýükle (restart-dan soň hem işleýär)

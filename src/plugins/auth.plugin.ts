@@ -9,6 +9,10 @@ declare module 'fastify' {
   }
 }
 
+/**
+ * HMAC-SHA256 of request body (JSON string) with ADMIN_SYNC_SECRET.
+ * For GET / body-less requests, clients must sign the empty object "{}".
+ */
 async function authPluginImpl(app: FastifyInstance) {
   app.decorate('verifyAdminSyncSignature', async (req: FastifyRequest, reply: FastifyReply) => {
     const signature = req.headers['x-admin-signature'];
@@ -16,9 +20,14 @@ async function authPluginImpl(app: FastifyInstance) {
       return reply.code(401).send({ error: 'Missing X-Admin-Signature header' });
     }
 
+    const payload =
+      req.body !== undefined && req.body !== null
+        ? JSON.stringify(req.body)
+        : '{}';
+
     const expected = crypto
       .createHmac('sha256', env.ADMIN_SYNC_SECRET)
-      .update(JSON.stringify(req.body))
+      .update(payload)
       .digest('hex');
 
     const sigBuf = Buffer.from(signature);
