@@ -168,7 +168,7 @@ export async function staffLookupHandler(req: FastifyRequest, reply: FastifyRepl
   }
 
   const db = await getDb();
-  const username = String(parsed.data.username || '').trim().toLowerCase();
+  const username = parsed.data.username.toLowerCase();
 
   // Check pending registration first
   const pending = (db.data.registrations || []).find(
@@ -196,43 +196,21 @@ export async function staffLookupHandler(req: FastifyRequest, reply: FastifyRepl
     });
   }
 
-  const uname = username.trim().toLowerCase();
-  const matches = (db.data.staff || []).filter(
-    (s) => String(s.username || '').trim().toLowerCase() === uname
+  const user = (db.data.staff || []).find(
+    (s) => s.username.toLowerCase() === username && s.active
   );
 
-  if (matches.length === 0) {
-    return reply.code(404).send({
-      error: 'not found',
-      message: `Ulanyjy "${parsed.data.username}" staff sanawynda ýok`,
-      staffCount: (db.data.staff || []).length,
-    });
-  }
-
-  // Prefer active; else return inactive with clear error
-  const user = matches.find((s) => s.active !== false) || matches[0];
-  if (user.active === false) {
-    return reply.code(403).send({
-      error: 'account_inactive',
-      message: 'Bu hasap öçürilen (active=false). Electron/BI-de işjeň ediň.',
-      username: user.username,
-    });
+  if (!user) {
+    return reply.code(404).send({ error: 'not found' });
   }
 
   const tenant = await tenantRepository.findBySlug(user.tenantSlug);
-  const hash = user.passwordHash || '';
-  const isPlaceholder =
-    !hash ||
-    hash.startsWith('synced-from-bi') ||
-    hash.startsWith('pending-reset') ||
-    hash.endsWith(':0000');
 
   return reply.send({
     id: user.id,
     username: user.username,
     fullName: user.fullName,
-    passwordHash: hash,
-    passwordUsable: !isPlaceholder,
+    passwordHash: user.passwordHash,
     role: user.role,
     tenantSlug: user.tenantSlug,
     tenantSlugs: user.tenantSlugs,
