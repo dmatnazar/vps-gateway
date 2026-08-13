@@ -1,7 +1,7 @@
 import type { FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import crypto from 'node:crypto';
-import { getDb } from '../../store/db';
+import { getDb, logSync } from '../../store/sqliteDb';
 import { tenantRepository } from '../tenant/tenant.repository';
 import { encryptPasswordPlain } from '../../core/db/passwordEnc';
 import type {
@@ -14,49 +14,50 @@ import type {
 // ── Catalog ──────────────────────────────────────────────────
 
 export async function catalogHandler(_req: FastifyRequest, reply: FastifyReply) {
-  const db = await getDb();
-  const tenants = (db.data.tenants || [])
-    .filter((t) => t.isActive)
-    .map((t) => ({
-      id: t.id,
-      slug: t.slug,
-      name: t.name,
-      isActive: t.isActive,
-      connections: (t.connections || []).map((c) => ({
-        dbKey: c.dbKey,
-        label: c.label,
-        database: c.database,
-      })),
-      updatedAt: t.updatedAt,
-    }));
+  const db = getDb();
 
-  const endpoints = (db.data.endpoints || []).map((e: any) => ({
-    id: e.id,
-    tenantSlug: e.tenantSlug,
-    name: e.name,
-    method: e.method,
-    pathTemplate: e.pathTemplate,
-    paramsSchema: e.paramsSchema,
-    cacheTtlSec: e.cacheTtlSec,
-    authRequired: e.authRequired,
-    dbKey: e.dbKey,
+  // Return all tenants (active + passive) so admin UIs can show / reactivate them
+  const tenantRows = db.prepare(`SELECT * FROM tenants`).all() as any[];
+  const connStmt = db.prepare(
+    `SELECT db_key as dbKey, label, database_name as database FROM tenant_connections WHERE tenant_id = ?`
+  );
+
+  const tenants = tenantRows.map((t) => ({
+    id: t.id,
+    slug: t.slug,
+    name: t.name,
+    isActive: Boolean(t.is_active),
+    connections: connStmt.all(t.id),
+    updatedAt: t.updated_at,
   }));
 
-  const staff = (db.data.staff || [])
-    .filter((s) => s.active)
-    .map((s) => ({
-      id: s.id,
-      tenantSlug: s.tenantSlug,
-      tenantSlugs: s.tenantSlugs,
-      fullName: s.fullName,
-      username: s.username,
-      role: s.role,
-      phone: s.phone,
-      email: s.email,
-      active: s.active,
-      passwordEnc: s.passwordEnc,
-      updatedAt: s.updatedAt,
-    }));
+  const endpointRows = db.prepare(`SELECT * FROM endpoints`).all() as any[];
+  const endpoints = endpointRows.map((e) => ({
+    id: e.id,
+    tenantSlug: e.tenant_slug,
+    name: e.name,
+    method: e.method,
+    pathTemplate: e.path_template,
+    paramsSchema: JSON.parse(e.params_schema || '{}'),
+    cacheTtlSec: e.cache_ttl_sec,
+    authRequired: Boolean(e.auth_required),
+    dbKey: e.db_key,
+  }));
+
+  const staffRows = db.prepare(`SELECT * FROM staff`).all() as any[];
+  const staff = staffRows.map((s) => ({
+    id: s.id,
+    tenantSlug: s.tenant_slug,
+    tenantSlugs: JSON.parse(s.tenant_slugs || '[]'),
+    fullName: s.full_name,
+    username: s.username,
+    role: s.role,
+    phone: s.phone,
+    email: s.email,
+    active: Boolean(s.active),
+    passwordEnc: s.password_enc,
+    updatedAt: s.updated_at,
+  }));
 
   return reply.send({
     tenants,
@@ -99,10 +100,8 @@ export async function syncStaffHandler(req: FastifyRequest, reply: FastifyReply)
     return reply.code(404).send({ error: `Tenant "${tenantSlug}" not found. Sync schema first.` });
   }
 
-  const db = await getDb();
+  const db = getDb();
   const now = new Date().toISOString();
-  const existingForTenant = (db.data.staff || []).filter((s) => s.tenantSlug === tenantSlug);
-  const others = (db.data.staff || []).filter((s) => s.tenantSlug !== tenantSlug);
 
   const isPlaceholder = (hash: string) =>
     !hash ||
@@ -110,47 +109,76 @@ export async function syncStaffHandler(req: FastifyRequest, reply: FastifyReply)
     hash.startsWith('pending-reset') ||
     hash.endsWith(':0000');
 
+  const existingForTenant = db
+    .prepare(`SELECT * FROM staff WHERE tenant_slug = ?`)
+    .all(tenantSlug) as any[];
   const byUsername = new Map(existingForTenant.map((s) => [s.username.toLowerCase(), s]));
 
-  const incoming: StaffRecord[] = staff.map((s) => {
-    const prev = byUsername.get(s.username.toLowerCase());
-    let passwordHash = s.passwordHash;
-    // Never wipe a real BI/Electron hash with a placeholder from local Electron mirror
-    if (isPlaceholder(passwordHash) && prev && !isPlaceholder(prev.passwordHash)) {
-      passwordHash = prev.passwordHash;
-    }
-    return {
-      id: prev?.id || s.id,
-      tenantSlug,
-      tenantSlugs: s.tenantSlugs?.length ? s.tenantSlugs : [tenantSlug],
-      fullName: s.fullName,
-      username: s.username,
-      passwordHash,
-      role: s.role as StaffRole,
-      phone: s.phone ?? prev?.phone,
-      email: s.email ?? prev?.email,
-      active: s.active,
-      passwordEnc: (s as any).passwordPlain
-        ? encryptPasswordPlain((s as any).passwordPlain)
-        : (s as any).passwordEnc || prev?.passwordEnc,
-      createdAt: prev?.createdAt || now,
-      updatedAt: now,
-    };
-  });
+  const upsertStmt = db.prepare(`
+    INSERT INTO staff (id, tenant_slug, tenant_slugs, full_name, username, password_hash, password_enc, role, phone, email, active, created_at, updated_at)
+    VALUES (@id, @tenantSlug, @tenantSlugs, @fullName, @username, @passwordHash, @passwordEnc, @role, @phone, @email, @active, @createdAt, @updatedAt)
+    ON CONFLICT(id) DO UPDATE SET
+      tenant_slug = excluded.tenant_slug,
+      tenant_slugs = excluded.tenant_slugs,
+      full_name = excluded.full_name,
+      username = excluded.username,
+      password_hash = excluded.password_hash,
+      password_enc = excluded.password_enc,
+      role = excluded.role,
+      phone = excluded.phone,
+      email = excluded.email,
+      active = excluded.active,
+      updated_at = excluded.updated_at
+  `);
 
-  // Keep VPS-only staff (approved from BI, not yet on Electron local list) if not in incoming
-  const incomingUsernames = new Set(incoming.map((s) => s.username.toLowerCase()));
-  const preserved = existingForTenant.filter(
-    (s) => !incomingUsernames.has(s.username.toLowerCase())
+  const incomingUsernames = new Set(
+    staff.map((s) => String(s.username || '').toLowerCase()).filter(Boolean)
   );
 
-  db.data.staff = [...others, ...preserved, ...incoming];
-  await db.write();
+  const tx = db.transaction(() => {
+    for (const s of staff) {
+      const prev = byUsername.get(s.username.toLowerCase());
+      let passwordHash = s.passwordHash;
+      if (isPlaceholder(passwordHash) && prev && !isPlaceholder(prev.password_hash)) {
+        passwordHash = prev.password_hash;
+      }
+
+      const passwordEnc = (s as any).passwordPlain
+        ? encryptPasswordPlain((s as any).passwordPlain)
+        : (s as any).passwordEnc || prev?.password_enc || '';
+
+      upsertStmt.run({
+        id: prev?.id || s.id,
+        tenantSlug,
+        tenantSlugs: JSON.stringify(s.tenantSlugs?.length ? s.tenantSlugs : [tenantSlug]),
+        fullName: s.fullName,
+        username: s.username,
+        passwordHash,
+        passwordEnc,
+        role: s.role,
+        phone: s.phone ?? prev?.phone ?? '',
+        email: s.email ?? prev?.email ?? '',
+        active: s.active ? 1 : 0,
+        createdAt: prev?.created_at || now,
+        updatedAt: now,
+      });
+    }
+
+    // Hard-remove staff for this tenant that are no longer in the payload
+    for (const prev of existingForTenant) {
+      if (!incomingUsernames.has(String(prev.username || '').toLowerCase())) {
+        db.prepare(`DELETE FROM staff WHERE id = ?`).run(prev.id);
+      }
+    }
+  });
+
+  tx();
+  logSync('sync', 'staff', tenant.id, 'electron', { count: staff.length, tenantSlug });
 
   return reply.send({
     status: 'success',
     tenantSlug,
-    staffLoaded: incoming.length,
+    staffLoaded: staff.length,
     syncedAt: now,
   });
 }
@@ -167,27 +195,30 @@ export async function staffLookupHandler(req: FastifyRequest, reply: FastifyRepl
     return reply.code(400).send({ error: 'username required' });
   }
 
-  const db = await getDb();
+  const db = getDb();
   const username = String(parsed.data.username || '').trim().toLowerCase();
 
   // Check pending registration first
-  const pending = (db.data.registrations || []).find(
-    (r) => r.username.toLowerCase() === username && r.status === 'pending'
-  );
+  const pending = db
+    .prepare(`SELECT * FROM registrations WHERE LOWER(username) = ? AND status = 'pending'`)
+    .get(username) as any;
   if (pending) {
     return reply.code(403).send({
       error: 'registration_pending',
       message: 'Hasaba alyş heniz tassyklanmady. Kompaniýa administratorynyň tassyklamagyny garaşyň.',
       registrationId: pending.id,
       status: 'pending',
-      deliveredAt: pending.deliveredAt || null,
+      deliveredAt: pending.delivered_at || null,
     });
   }
 
-  const rejected = (db.data.registrations || [])
-    .filter((r) => r.username.toLowerCase() === username && r.status === 'rejected')
-    .sort((a, b) => (b.reviewedAt || '').localeCompare(a.reviewedAt || ''))[0];
-  if (rejected && !(db.data.staff || []).some((s) => s.username.toLowerCase() === username && s.active)) {
+  const rejected = db
+    .prepare(`SELECT * FROM registrations WHERE LOWER(username) = ? AND status = 'rejected' ORDER BY reviewed_at DESC LIMIT 1`)
+    .get(username) as any;
+
+  const staffCount = (db.prepare(`SELECT COUNT(*) as c FROM staff WHERE LOWER(username) = ? AND active = 1`).get(username) as any).c;
+
+  if (rejected && staffCount === 0) {
     return reply.code(403).send({
       error: 'registration_rejected',
       message: 'Hasaba alyş islegiňiz ret edildi.' + (rejected.note ? ` Sebäp: ${rejected.note}` : ''),
@@ -196,22 +227,19 @@ export async function staffLookupHandler(req: FastifyRequest, reply: FastifyRepl
     });
   }
 
-  const uname = username.trim().toLowerCase();
-  const matches = (db.data.staff || []).filter(
-    (s) => String(s.username || '').trim().toLowerCase() === uname
-  );
+  const matches = db.prepare(`SELECT * FROM staff WHERE LOWER(username) = ?`).all(username) as any[];
 
   if (matches.length === 0) {
+    const totalStaffCount = (db.prepare(`SELECT COUNT(*) as c FROM staff`).get() as any).c;
     return reply.code(404).send({
       error: 'not found',
       message: `Ulanyjy "${parsed.data.username}" staff sanawynda ýok`,
-      staffCount: (db.data.staff || []).length,
+      staffCount: totalStaffCount,
     });
   }
 
-  // Prefer active; else return inactive with clear error
-  const user = matches.find((s) => s.active !== false) || matches[0];
-  if (user.active === false) {
+  const user = matches.find((s) => Boolean(s.active)) || matches[0];
+  if (!Boolean(user.active)) {
     return reply.code(403).send({
       error: 'account_inactive',
       message: 'Bu hasap öçürilen (active=false). Electron/BI-de işjeň ediň.',
@@ -219,8 +247,8 @@ export async function staffLookupHandler(req: FastifyRequest, reply: FastifyRepl
     });
   }
 
-  const tenant = await tenantRepository.findBySlug(user.tenantSlug);
-  const hash = user.passwordHash || '';
+  const tenant = await tenantRepository.findBySlug(user.tenant_slug);
+  const hash = user.password_hash || '';
   const isPlaceholder =
     !hash ||
     hash.startsWith('synced-from-bi') ||
@@ -230,17 +258,17 @@ export async function staffLookupHandler(req: FastifyRequest, reply: FastifyRepl
   return reply.send({
     id: user.id,
     username: user.username,
-    fullName: user.fullName,
+    fullName: user.full_name,
     passwordHash: hash,
     passwordUsable: !isPlaceholder,
     role: user.role,
-    tenantSlug: user.tenantSlug,
-    tenantSlugs: user.tenantSlugs,
+    tenantSlug: user.tenant_slug,
+    tenantSlugs: JSON.parse(user.tenant_slugs || '[]'),
     tenantName: tenant?.name,
     tenantId: tenant?.id,
     phone: user.phone,
     email: user.email,
-    active: user.active,
+    active: Boolean(user.active),
   });
 }
 
@@ -269,96 +297,83 @@ export async function createRegistrationHandler(req: FastifyRequest, reply: Fast
     return reply.code(404).send({ error: 'Company not found' });
   }
 
-  const db = await getDb();
-  const usernameTaken =
-    (db.data.staff || []).some((s) => s.username.toLowerCase() === data.username.toLowerCase()) ||
-    (db.data.registrations || []).some(
-      (r) => r.username.toLowerCase() === data.username.toLowerCase() && r.status === 'pending'
-    );
-  if (usernameTaken) {
+  const db = getDb();
+  const unameLower = data.username.toLowerCase();
+
+  const staffExists = db.prepare(`SELECT 1 FROM staff WHERE LOWER(username) = ?`).get(unameLower);
+  const regExists = db.prepare(`SELECT 1 FROM registrations WHERE LOWER(username) = ? AND status = 'pending'`).get(unameLower);
+
+  if (staffExists || regExists) {
     return reply.code(409).send({ error: 'Username already taken' });
   }
 
-  // normalize phone to +993...
   let phone = data.phone.trim();
   if (!phone.startsWith('+')) phone = '+993' + phone.replace(/^993/, '');
   if (!phone.startsWith('+993')) phone = '+993' + phone.replace(/^\+?/, '');
 
   const now = new Date().toISOString();
-  const reg: RegistrationRecord = {
-    id: crypto.randomUUID(),
-    tenantSlug: tenant.slug,
-    tenantName: tenant.name,
-    firstName: data.firstName,
-    lastName: data.lastName,
-    phone,
-    email: data.email,
-    username: data.username,
-    passwordHash: data.passwordHash,
-    status: 'pending',
-    requestedRole: data.requestedRole || 'viewer',
-    createdAt: now,
-  };
+  const id = crypto.randomUUID();
 
-  db.data.registrations = db.data.registrations || [];
-  db.data.registrations.push(reg);
-  await db.write();
+  db.prepare(`
+    INSERT INTO registrations (id, tenant_slug, tenant_name, first_name, last_name, phone, email, username, password_hash, status, requested_role, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+  `).run(id, tenant.slug, tenant.name, data.firstName, data.lastName, phone, data.email, data.username, data.passwordHash, data.requestedRole || 'viewer', now);
+
+  logSync('create', 'registration', id, 'bi', { username: data.username, tenantSlug: tenant.slug });
 
   return reply.send({
     ok: true,
-    registrationId: reg.id,
+    registrationId: id,
     status: 'pending',
     deliveredAt: null,
     message: 'Registration submitted to VPS. Waiting for company Electron admin.',
   });
 }
 
-/** GET registration status by id (BI polls after submit) */
 export async function getRegistrationHandler(req: FastifyRequest, reply: FastifyReply) {
   const { id } = req.params as { id: string };
-  const db = await getDb();
-  const reg = (db.data.registrations || []).find((r) => r.id === id);
+  const db = getDb();
+  const reg = db.prepare(`SELECT * FROM registrations WHERE id = ?`).get(id) as any;
   if (!reg) return reply.code(404).send({ error: 'not found' });
 
   return reply.send({
     id: reg.id,
     status: reg.status,
-    deliveredAt: reg.deliveredAt || null,
-    tenantSlug: reg.tenantSlug,
-    tenantName: reg.tenantName,
+    deliveredAt: reg.delivered_at || null,
+    tenantSlug: reg.tenant_slug,
+    tenantName: reg.tenant_name,
     username: reg.username,
-    reviewedAt: reg.reviewedAt || null,
+    reviewedAt: reg.reviewed_at || null,
     note: reg.note || null,
   });
 }
 
 export async function listRegistrationsHandler(req: FastifyRequest, reply: FastifyReply) {
   const q = req.query as { tenantSlug?: string; status?: string; markDelivered?: string };
-  const db = await getDb();
-  let list = db.data.registrations || [];
+  const db = getDb();
 
-  if (q.tenantSlug) list = list.filter((r) => r.tenantSlug === q.tenantSlug);
-  if (q.status) list = list.filter((r) => r.status === q.status);
+  let sql = 'SELECT id, tenant_slug as tenantSlug, tenant_name as tenantName, first_name as firstName, last_name as lastName, phone, email, username, status, requested_role as requestedRole, reviewed_by as reviewedBy, reviewed_at as reviewedAt, note, delivered_at as deliveredAt, created_at as createdAt FROM registrations WHERE 1=1';
+  const params: unknown[] = [];
 
-  // Electron polling → mark pending items as delivered
+  if (q.tenantSlug) {
+    sql += ' AND tenant_slug = ?';
+    params.push(q.tenantSlug);
+  }
+  if (q.status) {
+    sql += ' AND status = ?';
+    params.push(q.status);
+  }
+  sql += ' ORDER BY created_at DESC';
+
+  const list = db.prepare(sql).all(...params) as any[];
+
   const mark = q.markDelivered === '1' || q.markDelivered === 'true';
   if (mark) {
     const now = new Date().toISOString();
-    let changed = false;
-    for (const r of list) {
-      if (r.status === 'pending' && !r.deliveredAt) {
-        r.deliveredAt = now;
-        changed = true;
-      }
-    }
-    if (changed) await db.write();
+    db.prepare(`UPDATE registrations SET delivered_at = ? WHERE status = 'pending' AND (delivered_at IS NULL OR delivered_at = '')`).run(now);
   }
 
-  const safe = list
-    .map(({ passwordHash: _, ...rest }) => rest)
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-
-  return reply.send({ registrations: safe });
+  return reply.send({ registrations: list });
 }
 
 const UpdateRegSchema = z.object({
@@ -372,31 +387,47 @@ const UpdateRegSchema = z.object({
   note: z.string().optional(),
 });
 
-/** Electron can edit pending registration before approve */
 export async function updateRegistrationHandler(req: FastifyRequest, reply: FastifyReply) {
   const parsed = UpdateRegSchema.safeParse(req.body);
   if (!parsed.success) {
     return reply.code(400).send({ error: parsed.error.flatten() });
   }
+
   const { id, ...patch } = parsed.data;
-  const db = await getDb();
-  const reg = (db.data.registrations || []).find((r) => r.id === id);
+  const db = getDb();
+  const reg = db.prepare(`SELECT * FROM registrations WHERE id = ?`).get(id) as any;
+
   if (!reg) return reply.code(404).send({ error: 'Registration not found' });
   if (reg.status !== 'pending') {
     return reply.code(400).send({ error: 'Only pending registrations can be edited' });
   }
 
-  if (patch.firstName !== undefined) reg.firstName = patch.firstName;
-  if (patch.lastName !== undefined) reg.lastName = patch.lastName;
-  if (patch.phone !== undefined) reg.phone = patch.phone;
-  if (patch.email !== undefined) reg.email = patch.email;
-  if (patch.username !== undefined) reg.username = patch.username;
-  if (patch.requestedRole !== undefined) reg.requestedRole = patch.requestedRole;
-  if (patch.note !== undefined) reg.note = patch.note;
+  db.prepare(`
+    UPDATE registrations SET
+      first_name = COALESCE(?, first_name),
+      last_name = COALESCE(?, last_name),
+      phone = COALESCE(?, phone),
+      email = COALESCE(?, email),
+      username = COALESCE(?, username),
+      requested_role = COALESCE(?, requested_role),
+      note = COALESCE(?, note)
+    WHERE id = ?
+  `).run(
+    patch.firstName ?? null,
+    patch.lastName ?? null,
+    patch.phone ?? null,
+    patch.email ?? null,
+    patch.username ?? null,
+    patch.requestedRole ?? null,
+    patch.note ?? null,
+    id
+  );
 
-  await db.write();
-  const { passwordHash: _, ...safe } = reg;
-  return reply.send({ ok: true, registration: safe });
+  logSync('update', 'registration', id, 'electron', patch);
+
+  const updated = db.prepare(`SELECT id, tenant_slug as tenantSlug, tenant_name as tenantName, first_name as firstName, last_name as lastName, phone, email, username, status, requested_role as requestedRole, note, created_at as createdAt FROM registrations WHERE id = ?`).get(id);
+
+  return reply.send({ ok: true, registration: updated });
 }
 
 const ResolveRegSchema = z.object({
@@ -405,7 +436,6 @@ const ResolveRegSchema = z.object({
   note: z.string().optional(),
   role: z.enum(['admin', 'editor', 'viewer']).optional(),
   reviewedBy: z.string().optional(),
-  // optional overrides when approving after edit
   firstName: z.string().optional(),
   lastName: z.string().optional(),
   phone: z.string().optional(),
@@ -419,89 +449,100 @@ export async function resolveRegistrationHandler(req: FastifyRequest, reply: Fas
   }
 
   const { id, action, note, role, reviewedBy, firstName, lastName, phone, email } = parsed.data;
-  const db = await getDb();
-  const reg = (db.data.registrations || []).find((r) => r.id === id);
+  const db = getDb();
+  const reg = db.prepare(`SELECT * FROM registrations WHERE id = ?`).get(id) as any;
+
   if (!reg) return reply.code(404).send({ error: 'Registration not found' });
   if (reg.status !== 'pending') {
     return reply.code(400).send({ error: 'Already resolved' });
   }
 
-  if (firstName) reg.firstName = firstName;
-  if (lastName) reg.lastName = lastName;
-  if (phone) reg.phone = phone;
-  if (email) reg.email = email;
-
   const now = new Date().toISOString();
-  reg.status = action === 'approve' ? 'approved' : 'rejected';
-  reg.reviewedAt = now;
-  reg.reviewedBy = reviewedBy;
-  reg.note = note;
+  const newStatus = action === 'approve' ? 'approved' : 'rejected';
+
+  db.prepare(`
+    UPDATE registrations SET
+      status = ?,
+      reviewed_at = ?,
+      reviewed_by = ?,
+      note = ?,
+      first_name = COALESCE(?, first_name),
+      last_name = COALESCE(?, last_name),
+      phone = COALESCE(?, phone),
+      email = COALESCE(?, email)
+    WHERE id = ?
+  `).run(newStatus, now, reviewedBy || null, note || null, firstName || null, lastName || null, phone || null, email || null, id);
+
+  let staffOut: any = null;
 
   if (action === 'approve') {
-    const staffRole = (role || reg.requestedRole || 'viewer') as StaffRole;
-    const existingIdx = (db.data.staff || []).findIndex(
-      (s) => s.username.toLowerCase() === reg.username.toLowerCase()
+    const staffRole = role || reg.requested_role || 'viewer';
+    const existingStaff = db.prepare(`SELECT * FROM staff WHERE LOWER(username) = ?`).get(reg.username.toLowerCase()) as any;
+    const staffId = existingStaff ? existingStaff.id : crypto.randomUUID();
+    const finalFn = firstName || reg.first_name;
+    const finalLn = lastName || reg.last_name;
+
+    db.prepare(`
+      INSERT INTO staff (id, tenant_slug, tenant_slugs, full_name, username, password_hash, role, phone, email, active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        tenant_slug = excluded.tenant_slug,
+        tenant_slugs = excluded.tenant_slugs,
+        full_name = excluded.full_name,
+        password_hash = excluded.password_hash,
+        role = excluded.role,
+        phone = excluded.phone,
+        email = excluded.email,
+        active = 1,
+        updated_at = excluded.updated_at
+    `).run(
+      staffId,
+      reg.tenant_slug,
+      JSON.stringify([reg.tenant_slug]),
+      `${finalFn} ${finalLn}`.trim(),
+      reg.username,
+      reg.password_hash,
+      staffRole,
+      phone || reg.phone || '',
+      email || reg.email || '',
+      now,
+      now
     );
-    const staff: StaffRecord = {
-      id: existingIdx >= 0 ? db.data.staff[existingIdx].id : crypto.randomUUID(),
-      tenantSlug: reg.tenantSlug,
-      tenantSlugs: [reg.tenantSlug],
-      fullName: `${reg.firstName} ${reg.lastName}`.trim(),
-      username: reg.username,
-      passwordHash: reg.passwordHash,
-      role: staffRole,
-      phone: reg.phone,
-      email: reg.email,
-      active: true,
-      createdAt: now,
-      updatedAt: now,
-    };
-    if (existingIdx >= 0) db.data.staff[existingIdx] = staff;
-    else {
-      db.data.staff = db.data.staff || [];
-      db.data.staff.push(staff);
-    }
+
+    staffOut = db.prepare(`SELECT * FROM staff WHERE id = ?`).get(staffId);
   }
 
-  // notification for the user
-  const notif: UserNotification = {
-    id: crypto.randomUUID(),
-    username: reg.username,
-    type: action === 'approve' ? 'registration_approved' : 'registration_rejected',
-    title: action === 'approve' ? 'Hasaba alyş tassyklanyldy' : 'Hasaba alyş ret edildi',
-    message:
-      action === 'approve'
-        ? `${reg.tenantName} kompaniýasynda hasabyňyz açyldy. Indi girip bilersiňiz.`
-        : `Hasaba alyş islegiňiz ret edildi.` + (note ? ` Sebäp: ${note}` : ''),
-    read: false,
-    createdAt: now,
-  };
-  db.data.notifications = db.data.notifications || [];
-  db.data.notifications.push(notif);
+  // Create notification for user
+  const notifId = crypto.randomUUID();
+  db.prepare(`
+    INSERT INTO notifications (id, username, type, title, message, read, created_at)
+    VALUES (?, ?, ?, ?, ?, 0, ?)
+  `).run(
+    notifId,
+    reg.username,
+    action === 'approve' ? 'registration_approved' : 'registration_rejected',
+    action === 'approve' ? 'Hasaba alyş tassyklanyldy' : 'Hasaba alyş ret edildi',
+    action === 'approve'
+      ? `${reg.tenant_name || reg.tenant_slug} kompaniýasynda hasabyňyz açyldy. Indi girip bilersiňiz.`
+      : `Hasaba alyş islegiňiz ret edildi.` + (note ? ` Sebäp: ${note}` : ''),
+    now
+  );
 
-  await db.write();
-
-  // Return staff record so Electron can mirror without placeholder hash
-  let staffOut = null;
-  if (action === 'approve') {
-    staffOut = (db.data.staff || []).find(
-      (s) => s.username.toLowerCase() === reg.username.toLowerCase()
-    );
-  }
+  logSync(action === 'approve' ? 'update' : 'delete', 'registration', id, 'electron', { action, staffOut });
 
   return reply.send({
     ok: true,
-    status: reg.status,
+    status: newStatus,
     staff: staffOut
       ? {
           id: staffOut.id,
           username: staffOut.username,
-          fullName: staffOut.fullName,
-          passwordHash: staffOut.passwordHash,
+          fullName: staffOut.full_name,
+          passwordHash: staffOut.password_hash,
           role: staffOut.role,
           phone: staffOut.phone,
           email: staffOut.email,
-          tenantSlug: staffOut.tenantSlug,
+          tenantSlug: staffOut.tenant_slug,
         }
       : null,
   });
@@ -514,12 +555,17 @@ export async function listNotificationsHandler(req: FastifyRequest, reply: Fasti
   if (!q.username) {
     return reply.code(400).send({ error: 'username required' });
   }
-  const db = await getDb();
-  let list = (db.data.notifications || []).filter(
-    (n) => n.username.toLowerCase() === q.username!.toLowerCase()
-  );
-  if (q.unreadOnly === '1') list = list.filter((n) => !n.read);
-  list = list.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+  const db = getDb();
+  let sql = 'SELECT * FROM notifications WHERE LOWER(username) = ?';
+  const params: unknown[] = [q.username.toLowerCase()];
+
+  if (q.unreadOnly === '1') {
+    sql += ' AND read = 0';
+  }
+  sql += ' ORDER BY created_at DESC';
+
+  const list = db.prepare(sql).all(...params) as any[];
   return reply.send({ notifications: list });
 }
 
@@ -531,68 +577,130 @@ const MarkReadSchema = z.object({
 export async function markNotificationsReadHandler(req: FastifyRequest, reply: FastifyReply) {
   const parsed = MarkReadSchema.safeParse(req.body);
   if (!parsed.success) return reply.code(400).send({ error: 'bad body' });
-  const db = await getDb();
+
+  const db = getDb();
   const { ids, username } = parsed.data;
-  for (const n of db.data.notifications || []) {
-    if (ids?.includes(n.id) || (username && n.username.toLowerCase() === username.toLowerCase())) {
-      n.read = true;
-    }
+
+  if (ids && ids.length > 0) {
+    const placeholders = ids.map(() => '?').join(',');
+    db.prepare(`UPDATE notifications SET read = 1 WHERE id IN (${placeholders})`).run(...ids);
+  } else if (username) {
+    db.prepare(`UPDATE notifications SET read = 1 WHERE LOWER(username) = ?`).run(username.toLowerCase());
   }
-  await db.write();
+
   return reply.send({ ok: true });
 }
 
+// ── Tenant & Endpoint updates ────────────────────────────────
 
 const TenantUpdateSchema = z.object({
   slug: z.string().min(1),
   name: z.string().min(1).optional(),
   isActive: z.boolean().optional(),
+  /** Client's last known updated_at — reject if server is newer (concurrent edit) */
+  expectedUpdatedAt: z.string().optional(),
 });
 
 export async function tenantUpdateHandler(req: FastifyRequest, reply: FastifyReply) {
   const parsed = TenantUpdateSchema.safeParse(req.body);
   if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
-  const db = await getDb();
-  let t = (db.data.tenants || []).find((x) => x.slug === parsed.data.slug);
-  const now = new Date().toISOString();
 
-  // Create shell tenant if missing (BI "Ähli firmalar" create)
+  const db = getDb();
+  const now = new Date().toISOString();
+  let t = db.prepare(`SELECT * FROM tenants WHERE slug = ?`).get(parsed.data.slug) as any;
+
   if (!t) {
     if (!parsed.data.name) {
       return reply.code(404).send({ error: 'Tenant not found' });
     }
-    t = {
-      id: crypto.randomUUID(),
-      slug: parsed.data.slug,
-      name: parsed.data.name,
-      isActive: parsed.data.isActive !== false,
-      connections: [],
-      createdAt: now,
-      updatedAt: now,
-    } as any;
-    db.data.tenants = db.data.tenants || [];
-    db.data.tenants.push(t);
+    // New companies are always active by default
+    const id = crypto.randomUUID();
+    const active = parsed.data.isActive !== false ? 1 : 0;
+    db.prepare(`
+      INSERT INTO tenants (id, slug, name, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(id, parsed.data.slug, parsed.data.name, active, now, now);
+    t = { id, slug: parsed.data.slug, name: parsed.data.name, is_active: active };
+    logSync('create', 'tenant', id, 'bi', { slug: parsed.data.slug, isActive: active });
   } else {
-    if (parsed.data.name !== undefined) t.name = parsed.data.name;
-    if (parsed.data.isActive !== undefined) t.isActive = parsed.data.isActive;
-    t.updatedAt = now;
-  }
-
-  // Soft-delete cleanup
-  if (parsed.data.isActive === false) {
-    db.data.endpoints = (db.data.endpoints || []).filter((e: any) => e.tenantSlug !== t.slug);
-    for (const s of db.data.staff || []) {
-      if (s.tenantSlug === t.slug) s.active = false;
-      if (Array.isArray(s.tenantSlugs)) {
-        s.tenantSlugs = s.tenantSlugs.filter((x: string) => x !== t.slug);
+    // Concurrency: if client sends expectedUpdatedAt and server is newer → conflict
+    if (parsed.data.expectedUpdatedAt && t.updated_at) {
+      const clientTs = Date.parse(parsed.data.expectedUpdatedAt);
+      const serverTs = Date.parse(t.updated_at);
+      if (!Number.isNaN(clientTs) && !Number.isNaN(serverTs) && serverTs > clientTs) {
+        return reply.code(409).send({
+          error: 'conflict',
+          message: 'Başga ýerde üýtgedildi. Maglumatlar täzeden çekildi.',
+          tenant: {
+            id: t.id,
+            slug: t.slug,
+            name: t.name,
+            isActive: Boolean(t.is_active),
+            updatedAt: t.updated_at,
+          },
+        });
       }
     }
+
+    const newName = parsed.data.name ?? t.name;
+    const newActive = parsed.data.isActive !== undefined ? (parsed.data.isActive ? 1 : 0) : t.is_active;
+
+    db.prepare(`UPDATE tenants SET name = ?, is_active = ?, updated_at = ?, is_open = 0, opened_at = NULL, opened_by = NULL WHERE id = ?`).run(newName, newActive, now, t.id);
+    t.name = newName;
+    t.is_active = newActive;
+    logSync('update', 'tenant', t.id, 'electron', { slug: parsed.data.slug, isActive: newActive });
   }
 
-  await db.write();
-  return reply.send({ ok: true, tenant: { id: t.id, slug: t.slug, name: t.name, isActive: t.isActive } });
-}
+  // Soft-delete: keep is_active = 0; if related APIs exist, notify and deactivate staff
+  if (parsed.data.isActive === false) {
+    const epCount = (
+      db.prepare(`SELECT COUNT(*) as cnt FROM endpoints WHERE tenant_slug = ?`).get(t.slug) as { cnt: number }
+    )?.cnt ?? 0;
 
+    // Do not hard-delete endpoints — only soft-deactivate the company
+    db.prepare(`UPDATE staff SET active = 0 WHERE tenant_slug = ?`).run(t.slug);
+
+    const notifId = crypto.randomUUID();
+    const title = 'Kompaniýa öçürildi (passiw)';
+    const message =
+      epCount > 0
+        ? `«${t.name}» (${t.slug}) is_active=0 edildi. Bagly API sany: ${epCount}. API-lar saklandy, kompaniýa passiw.`
+        : `«${t.name}» (${t.slug}) is_active=0 edildi. Bagly API ýok.`;
+
+    // Notify all super/admin staff (or system-wide via empty username marker)
+    const admins = db
+      .prepare(
+        `SELECT DISTINCT username FROM staff WHERE role IN ('admin', 'super_admin') AND active = 1`
+      )
+      .all() as { username: string }[];
+
+    if (admins.length === 0) {
+      db.prepare(`
+        INSERT INTO notifications (id, username, type, title, message, read, created_at)
+        VALUES (?, ?, ?, ?, ?, 0, ?)
+      `).run(notifId, 'system', 'tenant_deactivated', title, message, now);
+    } else {
+      for (const a of admins) {
+        db.prepare(`
+          INSERT INTO notifications (id, username, type, title, message, read, created_at)
+          VALUES (?, ?, ?, ?, ?, 0, ?)
+        `).run(crypto.randomUUID(), a.username, 'tenant_deactivated', title, message, now);
+      }
+    }
+
+    logSync('update', 'tenant', t.id, 'electron', {
+      slug: t.slug,
+      isActive: 0,
+      relatedApis: epCount,
+      notification: true,
+    });
+  }
+
+  return reply.send({
+    ok: true,
+    tenant: { id: t.id, slug: t.slug, name: t.name, isActive: Boolean(t.is_active) },
+  });
+}
 
 const EndpointUpdateSchema = z.object({
   id: z.string(),
@@ -606,22 +714,177 @@ const EndpointUpdateSchema = z.object({
 export async function endpointUpdateHandler(req: FastifyRequest, reply: FastifyReply) {
   const parsed = EndpointUpdateSchema.safeParse(req.body);
   if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
-  const db = await getDb();
-  const ep = (db.data.endpoints || []).find((e: any) => e.id === parsed.data.id);
+
+  const db = getDb();
+  const now = new Date().toISOString();
+  const ep = db.prepare(`SELECT * FROM endpoints WHERE id = ?`).get(parsed.data.id) as any;
   if (!ep) return reply.code(404).send({ error: 'Endpoint not found' });
-  ep.name = parsed.data.name;
-  ep.pathTemplate = parsed.data.pathTemplate;
-  ep.method = parsed.data.method.toUpperCase();
-  if (parsed.data.dbKey) (ep as any).dbKey = parsed.data.dbKey;
-  (ep as any).updatedAt = new Date().toISOString();
-  await db.write();
+
+  db.prepare(`
+    UPDATE endpoints SET
+      name = ?,
+      path_template = ?,
+      method = ?,
+      db_key = COALESCE(?, db_key),
+      updated_at = ?
+    WHERE id = ?
+  `).run(
+    parsed.data.name,
+    parsed.data.pathTemplate,
+    parsed.data.method.toUpperCase(),
+    parsed.data.dbKey ?? null,
+    now,
+    ep.id
+  );
+
+  logSync('update', 'endpoint', ep.id, 'electron', { name: parsed.data.name, path: parsed.data.pathTemplate });
+
   try {
     const { routeRegistry } = await import('../../core/router/routeRegistry');
-    const tenantEps = (db.data.endpoints || []).filter((e: any) => e.tenantSlug === parsed.data.tenantSlug);
+    const tenantEps = await tenantRepository.listAllEndpoints();
+    const filtered = tenantEps.filter((e) => e.tenantSlug === parsed.data.tenantSlug);
     routeRegistry.replaceTenantRoutes(
       parsed.data.tenantSlug,
-      tenantEps.map((e: any) => ({ ...e, dbKey: e.dbKey || 'primary' })) as any
+      filtered.map((e: any) => ({ ...e, dbKey: e.dbKey || 'primary' })) as any
     );
   } catch { /* */ }
-  return reply.send({ ok: true, endpoint: { id: ep.id, name: ep.name, pathTemplate: ep.pathTemplate, method: ep.method } });
+
+  return reply.send({ ok: true, endpoint: { id: ep.id, name: parsed.data.name, pathTemplate: parsed.data.pathTemplate, method: parsed.data.method.toUpperCase() } });
+}
+
+
+// ── Edit locks (is_open) ─────────────────────────────────────
+
+const LOCK_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+const EntityLockSchema = z.object({
+  entityType: z.enum(['tenant', 'staff', 'endpoint']),
+  entityId: z.string().min(1),
+  action: z.enum(['lock', 'unlock', 'heartbeat']),
+  openedBy: z.string().optional(),
+});
+
+function lockTable(entityType: 'tenant' | 'staff' | 'endpoint'): string {
+  if (entityType === 'tenant') return 'tenants';
+  if (entityType === 'staff') return 'staff';
+  return 'endpoints';
+}
+
+export async function entityLockHandler(req: FastifyRequest, reply: FastifyReply) {
+  const parsed = EntityLockSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+
+  const { entityType, entityId, action, openedBy } = parsed.data;
+  const db = getDb();
+  const table = lockTable(entityType);
+  const now = new Date().toISOString();
+
+  const row = db.prepare(`SELECT * FROM ${table} WHERE id = ?`).get(entityId) as any;
+  if (!row) return reply.code(404).send({ error: 'Entity not found' });
+
+  const isOpen = Boolean(row.is_open);
+  const openedAtMs = row.opened_at ? Date.parse(row.opened_at) : 0;
+  const lockExpired = !openedAtMs || Date.now() - openedAtMs > LOCK_TTL_MS;
+  const sameUser = openedBy && row.opened_by && openedBy === row.opened_by;
+
+  if (action === 'lock') {
+    if (isOpen && !lockExpired && !sameUser) {
+      return reply.code(423).send({
+        error: 'locked',
+        message: `Bu ýazgy häzir başga ýerde üýtgedilýär (${row.opened_by || 'näbelli'}).`,
+        openedBy: row.opened_by,
+        openedAt: row.opened_at,
+      });
+    }
+    db.prepare(
+      `UPDATE ${table} SET is_open = 1, opened_at = ?, opened_by = ? WHERE id = ?`
+    ).run(now, openedBy || 'unknown', entityId);
+    return reply.send({ ok: true, locked: true, openedAt: now, openedBy: openedBy || 'unknown' });
+  }
+
+  if (action === 'heartbeat') {
+    if (!isOpen || lockExpired) {
+      return reply.code(423).send({ error: 'not_locked', message: 'Lock ýok ýa-da möhleti gutardy' });
+    }
+    if (!sameUser) {
+      return reply.code(423).send({ error: 'locked', message: 'Lock başga ulanyjyda' });
+    }
+    db.prepare(`UPDATE ${table} SET opened_at = ? WHERE id = ?`).run(now, entityId);
+    return reply.send({ ok: true, heartbeat: true, openedAt: now });
+  }
+
+  // unlock
+  db.prepare(
+    `UPDATE ${table} SET is_open = 0, opened_at = NULL, opened_by = NULL WHERE id = ?`
+  ).run(entityId);
+  return reply.send({ ok: true, locked: false });
+}
+
+// ── Hard delete tenant ───────────────────────────────────────
+
+const TenantDeleteSchema = z.object({
+  slug: z.string().min(1),
+});
+
+export async function tenantDeleteHandler(req: FastifyRequest, reply: FastifyReply) {
+  const parsed = TenantDeleteSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+
+  const db = getDb();
+  const t = db.prepare(`SELECT * FROM tenants WHERE slug = ?`).get(parsed.data.slug) as any;
+  if (!t) return reply.code(404).send({ error: 'Tenant not found' });
+
+  const staffCount = (
+    db.prepare(`SELECT COUNT(*) as c FROM staff WHERE tenant_slug = ?`).get(t.slug) as { c: number }
+  ).c;
+  const epCount = (
+    db.prepare(`SELECT COUNT(*) as c FROM endpoints WHERE tenant_slug = ?`).get(t.slug) as { c: number }
+  ).c;
+
+  if (staffCount > 0 || epCount > 0) {
+    return reply.code(409).send({
+      error: 'has_dependencies',
+      message: `Kompaniýany pozup bolmaýar: ${staffCount} işgär, ${epCount} API bar. Ilki olary aýyryň.`,
+      staffCount,
+      endpointCount: epCount,
+    });
+  }
+
+  db.prepare(`DELETE FROM tenant_connections WHERE tenant_id = ?`).run(t.id);
+  db.prepare(`DELETE FROM tenants WHERE id = ?`).run(t.id);
+  logSync('delete', 'tenant', t.id, 'electron', { slug: t.slug });
+
+  return reply.send({ ok: true, deleted: true, slug: t.slug });
+}
+
+// ── Hard delete staff ────────────────────────────────────────
+
+const StaffDeleteSchema = z.object({
+  id: z.string().optional(),
+  username: z.string().optional(),
+  tenantSlug: z.string().optional(),
+});
+
+export async function staffDeleteHandler(req: FastifyRequest, reply: FastifyReply) {
+  const parsed = StaffDeleteSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+
+  const db = getDb();
+  let row: any = null;
+  if (parsed.data.id) {
+    row = db.prepare(`SELECT * FROM staff WHERE id = ?`).get(parsed.data.id);
+  } else if (parsed.data.username) {
+    row = parsed.data.tenantSlug
+      ? db.prepare(`SELECT * FROM staff WHERE LOWER(username) = ? AND tenant_slug = ?`).get(
+          parsed.data.username.toLowerCase(),
+          parsed.data.tenantSlug
+        )
+      : db.prepare(`SELECT * FROM staff WHERE LOWER(username) = ?`).get(parsed.data.username.toLowerCase());
+  }
+  if (!row) return reply.code(404).send({ error: 'Staff not found' });
+
+  db.prepare(`DELETE FROM staff WHERE id = ?`).run(row.id);
+  logSync('delete', 'staff', row.id, 'electron', { username: row.username });
+
+  return reply.send({ ok: true, deleted: true, id: row.id, username: row.username });
 }

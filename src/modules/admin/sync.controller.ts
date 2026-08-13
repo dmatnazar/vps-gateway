@@ -4,6 +4,7 @@ import { tenantRepository } from '../tenant/tenant.repository';
 import { routeRegistry } from '../../core/router/routeRegistry';
 import { invalidateTenantPool } from '../../core/db/connectionPoolManager';
 import { encryptConnString } from '../../core/db/crypto';
+import { logSync } from '../../store/sqliteDb';
 
 const ParamDefSchema = z.object({
   name: z.string(),
@@ -58,7 +59,6 @@ export async function syncSchemaHandler(req: FastifyRequest, reply: FastifyReply
 
   let tenant = await tenantRepository.findBySlug(tenantSlug);
 
-  // Build encrypted multi-connection list if provided
   const encryptedConnections =
     connections?.map((c) => {
       const { enc, iv } = encryptConnString(c.connectionString);
@@ -108,6 +108,12 @@ export async function syncSchemaHandler(req: FastifyRequest, reply: FastifyReply
       dbKey: e.dbKey || 'primary',
     })) as any
   );
+
+  logSync('sync', 'tenant', tenant.id, 'electron', {
+    tenantSlug,
+    endpointsCount: endpoints.length,
+    connectionsCount: encryptedConnections?.length ?? 0,
+  });
 
   return reply.send({
     status: 'success',

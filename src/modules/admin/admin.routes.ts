@@ -13,6 +13,9 @@ import {
   markNotificationsReadHandler,
   tenantUpdateHandler,
   endpointUpdateHandler,
+  entityLockHandler,
+  tenantDeleteHandler,
+  staffDeleteHandler,
 } from './hub.controller';
 
 import { routeRegistry } from '../../core/router/routeRegistry';
@@ -35,6 +38,9 @@ export async function adminRoutes(app: FastifyInstance) {
   app.post('/api/admin/endpoint-update', { preHandler: [app.verifyAdminSyncSignature] }, endpointUpdateHandler);
 
   app.post('/api/admin/tenant-update', { preHandler: [app.verifyAdminSyncSignature] }, tenantUpdateHandler);
+  app.post('/api/admin/tenant-delete', { preHandler: [app.verifyAdminSyncSignature] }, tenantDeleteHandler);
+  app.post('/api/admin/staff-delete', { preHandler: [app.verifyAdminSyncSignature] }, staffDeleteHandler);
+  app.post('/api/admin/entity-lock', { preHandler: [app.verifyAdminSyncSignature] }, entityLockHandler);
 
   app.get('/api/admin/routes', async (_req, reply) => {
     return reply.send(routeRegistry.debugAll());

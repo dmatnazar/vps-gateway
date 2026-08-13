@@ -115,6 +115,8 @@ function buildConfig(
       encrypt,
       trustServerCertificate: trust,
       enableArithAbort: true,
+      /** Keep datetime values as local wall-clock (no UTC shift to SQL) */
+      useUTC: false,
       connectTimeout: 20000,
       // Avoid some TLS handshake hangs on older SQL Server
       cryptoCredentialsDetails: undefined,
