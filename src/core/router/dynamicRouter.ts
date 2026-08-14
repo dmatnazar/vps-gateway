@@ -1,9 +1,10 @@
 import type { FastifyInstance } from 'fastify';
 import { routeRegistry } from './routeRegistry';
-import { bindParams, MissingParamError } from './paramBinder';
+import { bindParams, extractParamValues, MissingParamError } from './paramBinder';
 import { getTenantPool } from '../db/connectionPoolManager';
 import { cacheManager } from '../cache/cacheManager';
 import { mapResponse } from '../responseMapper/mapper';
+import { agentTunnelManager } from '../tunnel/agentTunnelManager';
 
 async function handleDynamic(
   req: any,
@@ -43,19 +44,76 @@ async function handleDynamic(
     if (cached) return reply.send(cached);
   }
 
+  const debugOn =
+    (req.query as any)?.debug === '1' ||
+    req.headers['x-debug-params'] === '1';
+
+  const q = (req.query || {}) as Record<string, unknown>;
+  const dateish: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries({ ...q, ...(typeof req.body === 'object' && req.body ? req.body as any : {}) })) {
+    if (/date|begin|end|start|from|to/i.test(k)) dateish[k] = v;
+  }
+
+  // -------------------------------------------------------------
+  // 1) REVERSE WEBSOCKET TUNNEL: Check if Local Electron Agent is online
+  // -------------------------------------------------------------
+  if (agentTunnelManager.isAgentOnline(tenantSlug)) {
+    try {
+      const extractedParams = extractParamValues(endpoint, params, req);
+      req.log.info({ tenantSlug, endpoint: endpoint.name, extractedParams }, 'dispatching-query-via-agent-tunnel');
+
+      const tunnelResult = await agentTunnelManager.executeRemoteQuery(tenantSlug, {
+        sqlQuery: endpoint.sqlQuery,
+        params: extractedParams,
+        dbKey: effectiveDbKey,
+      });
+
+      if (!tunnelResult.ok) {
+        return reply.code(500).send({
+          error: tunnelResult.error || 'Ýerli kompýuterde SQL soragy şowsuz boldy',
+          source: 'local-electron-agent',
+        });
+      }
+
+      let body: any = endpoint.responseSchema
+        ? mapResponse(tunnelResult.rows || [], endpoint.responseSchema)
+        : tunnelResult.rows || [];
+
+      if (endpoint.cacheTtlSec > 0) {
+        await cacheManager.set(cacheKey, body, endpoint.cacheTtlSec);
+      }
+
+      if (debugOn) {
+        if (Array.isArray(body)) {
+          body = { rows: body, _debugParams: dateish, _via: 'agent-tunnel', _elapsedMs: tunnelResult.elapsedMs };
+        } else if (body && typeof body === 'object') {
+          body = { ...body, _debugParams: dateish, _via: 'agent-tunnel', _elapsedMs: tunnelResult.elapsedMs };
+        }
+      }
+
+      return reply.send(body);
+    } catch (err) {
+      if (err instanceof MissingParamError) {
+        return reply.code(400).send({ error: err.message });
+      }
+      req.log.error(err);
+      return reply.code(500).send({
+        error: 'Agent tunnel query execution failed',
+        detail: (err as Error).message,
+      });
+    }
+  }
+
+  // -------------------------------------------------------------
+  // 2) FALLBACK: Direct MSSQL Connection Pool (if direct access is available)
+  // -------------------------------------------------------------
   try {
     const pool = await getTenantPool(tenantSlug, effectiveDbKey);
     const sqlRequest = pool.request();
     bindParams(sqlRequest, endpoint, params, req);
 
-    // Collect bound param values for diagnostics (query ?debug=1 or header)
-    const debugOn =
-      (req.query as any)?.debug === '1' ||
-      req.headers['x-debug-params'] === '1';
     const bound: Record<string, unknown> = {};
     try {
-      const inputs = (sqlRequest as any).parameters || (sqlRequest as any).parameters;
-      // tedious/mssql stores in request.parameters
       const pr = (sqlRequest as any).parameters;
       if (pr && typeof pr === 'object') {
         for (const [k, v] of Object.entries(pr)) {
@@ -65,15 +123,9 @@ async function handleDynamic(
     } catch {
       /* ignore */
     }
-    // Always log date-like query values
-    const q = (req.query || {}) as Record<string, unknown>;
-    const dateish: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries({ ...q, ...(typeof req.body === 'object' && req.body ? req.body as any : {}) })) {
-      if (/date|begin|end|start|from|to/i.test(k)) dateish[k] = v;
-    }
+
     if (Object.keys(dateish).length) {
       req.log.info({ dateParams: dateish, bound }, 'filter-date-params');
-      console.log('[filter-date-params]', JSON.stringify(dateish), 'bound=', JSON.stringify(bound));
     }
 
     const result = await sqlRequest.query(endpoint.sqlQuery);
@@ -87,9 +139,9 @@ async function handleDynamic(
 
     if (debugOn) {
       if (Array.isArray(body)) {
-        body = { rows: body, _debugParams: dateish, _bound: bound };
+        body = { rows: body, _debugParams: dateish, _bound: bound, _via: 'direct-mssql' };
       } else if (body && typeof body === 'object') {
-        body = { ...body, _debugParams: dateish, _bound: bound };
+        body = { ...body, _debugParams: dateish, _bound: bound, _via: 'direct-mssql' };
       }
     }
 
@@ -99,9 +151,21 @@ async function handleDynamic(
       return reply.code(400).send({ error: err.message });
     }
     req.log.error(err);
+
+    const errMsg = (err as Error).message || String(err);
+    const isOfflineHint =
+      errMsg.includes('ECONNREFUSED') ||
+      errMsg.includes('ETIMEDOUT') ||
+      errMsg.includes('socket hang up') ||
+      errMsg.includes('failed to connect') ||
+      errMsg.includes('Failed to connect to');
+
     return reply.code(500).send({
       error: 'Query execution failed',
-      detail: (err as Error).message,
+      detail: errMsg,
+      hint: isOfflineHint
+        ? `Bu kompaniýanyň ýerli bazasyna gönüden-göni birigip bolmady we Electron Agent hem birikdirilmedik. Kompýuterde Electron programmasyny açyň.`
+        : undefined,
     });
   }
 }

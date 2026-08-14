@@ -1,8 +1,10 @@
 import Fastify, { FastifyInstance } from 'fastify';
 import rateLimit from '@fastify/rate-limit';
+import websocket from '@fastify/websocket';
 import { authPlugin } from './plugins/auth.plugin';
 import { adminRoutes } from './modules/admin/admin.routes';
 import { healthRoutes } from './modules/health/health.routes';
+import { agentRoutes } from './modules/agent/agent.routes';
 import { registerDynamicRouter } from './core/router/dynamicRouter';
 import { registerAvatarRoutes } from './modules/avatar/avatar.routes';
 import { routeRegistry } from './core/router/routeRegistry';
@@ -62,9 +64,11 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   await app.register(rateLimit, { max: 200, timeWindow: '1 minute' });
+  await app.register(websocket);
   await app.register(authPlugin);
   await app.register(healthRoutes);
   await app.register(adminRoutes);
+  await app.register(agentRoutes);
   await registerAvatarRoutes(app);
   await registerDynamicRouter(app);
 

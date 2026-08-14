@@ -5,6 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.MissingParamError = void 0;
 exports.bindParams = bindParams;
+exports.extractParamValues = extractParamValues;
 const mssql_1 = __importDefault(require("mssql"));
 const TYPE_MAP = {
     int: () => mssql_1.default.Int,
@@ -182,5 +183,67 @@ function bindParams(sqlRequest, endpoint, routeParams, req) {
         }
         sqlRequest.input(sqlName, sqlType, coerced);
     }
+}
+/**
+ * Extracts a plain JS object of { [paramName]: value } for sending over WebSocket agent tunnel.
+ */
+function extractParamValues(endpoint, routeParams, req) {
+    const query = (req.query ?? {});
+    const body = (req.body ?? {});
+    const result = {};
+    const defs = [
+        ...endpoint.paramsSchema.urlParams.map((p) => ({ ...p, source: 'url' })),
+        ...endpoint.paramsSchema.queryParams.map((p) => ({ ...p, source: 'query' })),
+        ...endpoint.paramsSchema.bodyParams.map((p) => ({ ...p, source: 'body' })),
+    ];
+    for (const def of defs) {
+        const sqlName = (def.sqlParam || def.name || '').replace(/^@/, '');
+        const apiName = def.name || sqlName;
+        let raw;
+        if (def.source === 'url') {
+            raw = pick(routeParams, apiName, sqlName);
+        }
+        else if (def.source === 'query') {
+            raw = pick(query, apiName, sqlName);
+        }
+        else {
+            raw = pick(body, apiName, sqlName);
+        }
+        const value = raw !== undefined ? raw : def.default ?? null;
+        if (def.required && (value === null || value === undefined || value === '')) {
+            throw new MissingParamError(apiName || sqlName || def.sqlParam);
+        }
+        if (!sqlName)
+            continue;
+        if (value === null || value === undefined || value === '') {
+            result[sqlName] = null;
+            continue;
+        }
+        const rawStr = String(value);
+        const looksLikeDate = def.type === 'date' ||
+            def.type === 'datetime' ||
+            DATE_VALUE_RE.test(rawStr.trim()) ||
+            BEGIN_NAME_RE.test(sqlName) ||
+            BEGIN_NAME_RE.test(apiName) ||
+            END_NAME_RE.test(sqlName) ||
+            END_NAME_RE.test(apiName);
+        if (looksLikeDate) {
+            result[sqlName] = forceLocalDateTimeString(value, sqlName, apiName, def.type);
+            continue;
+        }
+        let coerced = value;
+        if (def.type === 'int' || def.type === 'bigint') {
+            coerced = typeof value === 'number' ? value : parseInt(String(value), 10);
+        }
+        else if (def.type === 'float') {
+            coerced = typeof value === 'number' ? value : parseFloat(String(value));
+        }
+        else if (def.type === 'bit') {
+            const s = String(value).toLowerCase();
+            coerced = s === '1' || s === 'true' || s === 'yes';
+        }
+        result[sqlName] = coerced;
+    }
+    return result;
 }
 //# sourceMappingURL=paramBinder.js.map

@@ -204,3 +204,78 @@ export function bindParams(
     sqlRequest.input(sqlName, sqlType, coerced);
   }
 }
+
+/**
+ * Extracts a plain JS object of { [paramName]: value } for sending over WebSocket agent tunnel.
+ */
+export function extractParamValues(
+  endpoint: EndpointConfig,
+  routeParams: Record<string, string>,
+  req: FastifyRequest
+): Record<string, unknown> {
+  const query = (req.query ?? {}) as Record<string, unknown>;
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+
+  const defs = [
+    ...endpoint.paramsSchema.urlParams.map((p) => ({ ...p, source: 'url' as const })),
+    ...endpoint.paramsSchema.queryParams.map((p) => ({ ...p, source: 'query' as const })),
+    ...endpoint.paramsSchema.bodyParams.map((p) => ({ ...p, source: 'body' as const })),
+  ];
+
+  for (const def of defs) {
+    const sqlName = (def.sqlParam || def.name || '').replace(/^@/, '');
+    const apiName = def.name || sqlName;
+
+    let raw: unknown;
+    if (def.source === 'url') {
+      raw = pick(routeParams, apiName, sqlName);
+    } else if (def.source === 'query') {
+      raw = pick(query, apiName, sqlName);
+    } else {
+      raw = pick(body, apiName, sqlName);
+    }
+
+    const value = raw !== undefined ? raw : def.default ?? null;
+
+    if (def.required && (value === null || value === undefined || value === '')) {
+      throw new MissingParamError(apiName || sqlName || def.sqlParam);
+    }
+
+    if (!sqlName) continue;
+
+    if (value === null || value === undefined || value === '') {
+      result[sqlName] = null;
+      continue;
+    }
+
+    const rawStr = String(value);
+    const looksLikeDate =
+      def.type === 'date' ||
+      def.type === 'datetime' ||
+      DATE_VALUE_RE.test(rawStr.trim()) ||
+      BEGIN_NAME_RE.test(sqlName) ||
+      BEGIN_NAME_RE.test(apiName) ||
+      END_NAME_RE.test(sqlName) ||
+      END_NAME_RE.test(apiName);
+
+    if (looksLikeDate) {
+      result[sqlName] = forceLocalDateTimeString(value, sqlName, apiName, def.type);
+      continue;
+    }
+
+    let coerced: unknown = value;
+    if (def.type === 'int' || def.type === 'bigint') {
+      coerced = typeof value === 'number' ? value : parseInt(String(value), 10);
+    } else if (def.type === 'float') {
+      coerced = typeof value === 'number' ? value : parseFloat(String(value));
+    } else if (def.type === 'bit') {
+      const s = String(value).toLowerCase();
+      coerced = s === '1' || s === 'true' || s === 'yes';
+    }
+
+    result[sqlName] = coerced;
+  }
+
+  return result;
+}

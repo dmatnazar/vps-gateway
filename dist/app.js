@@ -6,9 +6,11 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.buildApp = buildApp;
 const fastify_1 = __importDefault(require("fastify"));
 const rate_limit_1 = __importDefault(require("@fastify/rate-limit"));
+const websocket_1 = __importDefault(require("@fastify/websocket"));
 const auth_plugin_1 = require("./plugins/auth.plugin");
 const admin_routes_1 = require("./modules/admin/admin.routes");
 const health_routes_1 = require("./modules/health/health.routes");
+const agent_routes_1 = require("./modules/agent/agent.routes");
 const dynamicRouter_1 = require("./core/router/dynamicRouter");
 const avatar_routes_1 = require("./modules/avatar/avatar.routes");
 const routeRegistry_1 = require("./core/router/routeRegistry");
@@ -55,9 +57,11 @@ async function buildApp() {
         }
     });
     await app.register(rate_limit_1.default, { max: 200, timeWindow: '1 minute' });
+    await app.register(websocket_1.default);
     await app.register(auth_plugin_1.authPlugin);
     await app.register(health_routes_1.healthRoutes);
     await app.register(admin_routes_1.adminRoutes);
+    await app.register(agent_routes_1.agentRoutes);
     await (0, avatar_routes_1.registerAvatarRoutes)(app);
     await (0, dynamicRouter_1.registerDynamicRouter)(app);
     // Diskden route-lary ýükle (restart-dan soň hem işleýär)
