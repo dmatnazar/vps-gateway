@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { routeRegistry } from './routeRegistry';
 import { bindParams, extractParamValues, MissingParamError } from './paramBinder';
-import { getTenantPool } from '../db/connectionPoolManager';
+import { getTenantPool, isPrivateIp, resolveConnString, parseConnectionString } from '../db/connectionPoolManager';
 import { cacheManager } from '../cache/cacheManager';
 import { mapResponse } from '../responseMapper/mapper';
 import { agentTunnelManager } from '../tunnel/agentTunnelManager';
@@ -107,6 +107,22 @@ async function handleDynamic(
   // -------------------------------------------------------------
   // 2) FALLBACK: Direct MSSQL Connection Pool (if direct access is available)
   // -------------------------------------------------------------
+  try {
+    const connStr = await resolveConnString(tenantSlug, effectiveDbKey);
+    const parsed = parseConnectionString(connStr);
+    if (parsed.server && isPrivateIp(parsed.server)) {
+      return reply.code(503).send({
+        error: 'Ýerli Electron Agent birikdirilmedik',
+        detail: `MSSQL maglumat bazasy ýerli torda (${parsed.server}:${parsed.port || 1433}) ýerleşýär. VPS Gateway ýerli tora gönüden-göni baglanyp bilmeýär.`,
+        hint: `Bu kompaniýanyň ýerli kompýuterindäki Electron programmasyny işlediň (VPS Tunnel arkaly maglumat berer).`,
+        tenantSlug,
+        agentOnline: false,
+      });
+    }
+  } catch {
+    /* ignore and proceed */
+  }
+
   try {
     const pool = await getTenantPool(tenantSlug, effectiveDbKey);
     const sqlRequest = pool.request();

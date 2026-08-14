@@ -89,7 +89,7 @@ export function parseConnectionString(connStr: string): {
   };
 }
 
-function isPrivateIp(host: string): boolean {
+export function isPrivateIp(host: string): boolean {
   const h = host.replace(/^\[|\]$/g, '');
   if (h === 'localhost' || h === '127.0.0.1' || h === '::1') return true;
   if (/^10\./.test(h)) return true;
@@ -162,7 +162,7 @@ async function tryConnect(config: sql.config): Promise<sql.ConnectionPool> {
   }
 }
 
-async function resolveConnString(tenantSlug: string, dbKey?: string): Promise<string> {
+export async function resolveConnString(tenantSlug: string, dbKey?: string): Promise<string> {
   const tenant = await tenantRepository.findBySlug(tenantSlug);
   if (!tenant || !tenant.isActive) {
     throw new Error(`Unknown or inactive tenant: ${tenantSlug}`);

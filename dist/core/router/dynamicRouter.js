@@ -91,6 +91,22 @@ async function handleDynamic(req, reply, tenantSlug, wildcard, dbKey) {
     // 2) FALLBACK: Direct MSSQL Connection Pool (if direct access is available)
     // -------------------------------------------------------------
     try {
+        const connStr = await (0, connectionPoolManager_1.resolveConnString)(tenantSlug, effectiveDbKey);
+        const parsed = (0, connectionPoolManager_1.parseConnectionString)(connStr);
+        if (parsed.server && (0, connectionPoolManager_1.isPrivateIp)(parsed.server)) {
+            return reply.code(503).send({
+                error: 'Ýerli Electron Agent birikdirilmedik',
+                detail: `MSSQL maglumat bazasy ýerli torda (${parsed.server}:${parsed.port || 1433}) ýerleşýär. VPS Gateway ýerli tora gönüden-göni baglanyp bilmeýär.`,
+                hint: `Bu kompaniýanyň ýerli kompýuterindäki Electron programmasyny işlediň (VPS Tunnel arkaly maglumat berer).`,
+                tenantSlug,
+                agentOnline: false,
+            });
+        }
+    }
+    catch {
+        /* ignore and proceed */
+    }
+    try {
         const pool = await (0, connectionPoolManager_1.getTenantPool)(tenantSlug, effectiveDbKey);
         const sqlRequest = pool.request();
         (0, paramBinder_1.bindParams)(sqlRequest, endpoint, params, req);

@@ -4,6 +4,8 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.parseConnectionString = parseConnectionString;
+exports.isPrivateIp = isPrivateIp;
+exports.resolveConnString = resolveConnString;
 exports.getTenantPool = getTenantPool;
 exports.invalidateTenantPool = invalidateTenantPool;
 const mssql_1 = __importDefault(require("mssql"));
