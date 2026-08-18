@@ -36,6 +36,9 @@ class AgentTunnelManager {
   /** Map of tenantSlug -> Set of active AgentConnections */
   private agents = new Map<string, Set<AgentConnection>>();
 
+  /** Round-robin index per tenant for load distribution */
+  private roundRobinIndices = new Map<string, number>();
+
   /** Map of requestId -> PendingRequest */
   private pendingRequests = new Map<string, PendingRequest>();
 
@@ -196,8 +199,10 @@ class AgentTunnelManager {
       };
     }
 
-    // Select the first active connection (or round-robin)
-    const conn = activeConns[0];
+    // Select connection via round-robin for optimal load distribution
+    const currentIdx = (this.roundRobinIndices.get(tenantSlug) || 0) % activeConns.length;
+    this.roundRobinIndices.set(tenantSlug, currentIdx + 1);
+    const conn = activeConns[currentIdx];
     const requestId = 'rq_' + crypto.randomUUID();
     const timeoutMs = payload.timeoutMs || 35_000;
 

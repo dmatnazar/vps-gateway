@@ -4,11 +4,11 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 /**
- * Integration test script to verify full CRUD operations and sync_log auditing
- * on the VPS Gateway SQLite control plane database.
- *
- * Runs without needing a live network connection by invoking repository and controller logic directly.
- */
+* Integration test script to verify full CRUD operations and sync_log auditing
+* on the VPS Gateway SQLite control plane database.
+*
+* Runs without needing a live network connection by invoking repository and controller logic directly.
+*/
 const tenant_repository_1 = require("./modules/tenant/tenant.repository");
 const sqliteDb_1 = require("./store/sqliteDb");
 const node_crypto_1 = __importDefault(require("node:crypto"));

@@ -11,6 +11,7 @@ const auth_plugin_1 = require("./plugins/auth.plugin");
 const admin_routes_1 = require("./modules/admin/admin.routes");
 const health_routes_1 = require("./modules/health/health.routes");
 const agent_routes_1 = require("./modules/agent/agent.routes");
+const public_auth_routes_1 = require("./modules/auth/public.auth.routes");
 const dynamicRouter_1 = require("./core/router/dynamicRouter");
 const avatar_routes_1 = require("./modules/avatar/avatar.routes");
 const routeRegistry_1 = require("./core/router/routeRegistry");
@@ -56,10 +57,18 @@ async function buildApp() {
             await reply.code(204).send();
         }
     });
-    await app.register(rate_limit_1.default, { max: 200, timeWindow: '1 minute' });
+    await app.register(rate_limit_1.default, {
+        max: 5000,
+        timeWindow: '1 minute',
+        keyGenerator: (req) => {
+            const deviceId = req.query?.deviceId || req.body?.deviceId || req.ip || 'unknown';
+            return `device:${deviceId}`;
+        },
+    });
     await app.register(websocket_1.default);
     await app.register(auth_plugin_1.authPlugin);
     await app.register(health_routes_1.healthRoutes);
+    await (0, public_auth_routes_1.publicAuthRoutes)(app);
     await app.register(admin_routes_1.adminRoutes);
     await app.register(agent_routes_1.agentRoutes);
     await (0, avatar_routes_1.registerAvatarRoutes)(app);

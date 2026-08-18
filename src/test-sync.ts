@@ -1,9 +1,9 @@
 /**
- * Integration test script to verify full CRUD operations and sync_log auditing
- * on the VPS Gateway SQLite control plane database.
- *
- * Runs without needing a live network connection by invoking repository and controller logic directly.
- */
+* Integration test script to verify full CRUD operations and sync_log auditing
+* on the VPS Gateway SQLite control plane database.
+*
+* Runs without needing a live network connection by invoking repository and controller logic directly.
+*/
 import { tenantRepository } from './modules/tenant/tenant.repository';
 import { getDb, getSyncLogs } from './store/sqliteDb';
 import crypto from 'node:crypto';

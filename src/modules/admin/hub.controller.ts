@@ -59,12 +59,84 @@ export async function catalogHandler(_req: FastifyRequest, reply: FastifyReply) 
     updatedAt: s.updated_at,
   }));
 
+  const deviceRows = db.prepare(`
+    SELECT d.*, t.name as company_name, t.slug as company_slug,
+      GROUP_CONCAT(DISTINCT da.tenant_slug) as all_tenant_slugs,
+      GROUP_CONCAT(DISTINCT tn.name) as all_tenant_names
+    FROM devices d
+    LEFT JOIN tenants t ON d.tenant_slug = t.slug
+    LEFT JOIN device_assignments da ON d.id = da.device_id
+    LEFT JOIN tenants tn ON da.tenant_slug = tn.slug
+    GROUP BY d.id
+    ORDER BY d.created_at DESC
+  `).all() as any[];
+  const devices = deviceRows.map((d) => {
+    const companySlugs = d.all_tenant_slugs ? d.all_tenant_slugs.split(',') : (d.company_slug ? [d.company_slug] : []);
+    const companyNames = d.all_tenant_names ? d.all_tenant_names.split(',') : (d.company_name ? [d.company_name] : []);
+    return {
+      id: d.id,
+      name: d.name,
+      hostname: d.hostname,
+      osPlatform: d.os_platform,
+      osRelease: d.os_release,
+      ramGb: d.ram_gb,
+      cpuModel: d.cpu_model,
+      macAddress: d.mac_address,
+      ipAddress: d.ip_address,
+      tenantId: d.tenant_id,
+      tenantSlug: d.tenant_slug || d.company_slug || '',
+      companyName: d.company_name || '',
+      companySlugs,
+      companyNames,
+      status: d.status,
+      appVersion: d.app_version,
+      lastSeenAt: d.last_seen_at,
+      createdAt: d.created_at,
+      updatedAt: d.updated_at,
+    };
+  });
+
   return reply.send({
     tenants,
     endpoints,
     staff,
+    devices,
     syncedAt: new Date().toISOString(),
   });
+}
+
+// ── Tenant (Company) CRUD ─────────────────────────────────────
+
+const CreateTenantSchema = z.object({
+  slug: z.string().min(1).max(100).regex(/^[a-z0-9-]+$/),
+  name: z.string().min(1).max(200),
+});
+
+export async function createTenantHandler(req: FastifyRequest, reply: FastifyReply) {
+  const parsed = CreateTenantSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+
+  const { slug, name } = parsed.data;
+  const db = getDb();
+
+  const existing = db.prepare(`SELECT id FROM tenants WHERE slug = ?`).get(slug) as any;
+  if (existing) {
+    return reply.code(409).send({ error: `Tenant "${slug}" already exists`, tenantId: existing.id });
+  }
+
+  const now = new Date().toISOString();
+  const id = crypto.randomUUID();
+
+  db.prepare(`
+    INSERT INTO tenants (id, slug, name, is_active, created_at, updated_at)
+    VALUES (?, ?, ?, 1, ?, ?)
+  `).run(id, slug, name, now, now);
+
+  logSync('create', 'tenant', id, 'bi_admin', { slug, name });
+
+  return reply.send({ ok: true, tenant: { id, slug, name, isActive: true, createdAt: now, updatedAt: now } });
 }
 
 // ── Staff sync ───────────────────────────────────────────────
@@ -77,7 +149,7 @@ const StaffSyncSchema = z.object({
       fullName: z.string().min(1),
       username: z.string().min(1),
       passwordHash: z.string().min(1),
-      role: z.enum(['admin', 'editor', 'viewer']),
+      role: z.enum(['admin', 'editor', 'manager', 'viewer']),
       tenantSlugs: z.array(z.string()).optional(),
       phone: z.string().optional(),
       email: z.string().optional(),
@@ -189,6 +261,11 @@ const AuthLookupSchema = z.object({
   username: z.string().min(1),
 });
 
+const StaffVerifySchema = z.object({
+  username: z.string().min(1),
+  password: z.string().min(1),
+});
+
 export async function staffLookupHandler(req: FastifyRequest, reply: FastifyReply) {
   const parsed = AuthLookupSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -272,6 +349,52 @@ export async function staffLookupHandler(req: FastifyRequest, reply: FastifyRepl
   });
 }
 
+export async function staffVerifyHandler(req: FastifyRequest, reply: FastifyReply) {
+  const parsed = StaffVerifySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+
+  const { username, password } = parsed.data;
+  const db = getDb();
+  const user = db
+    .prepare(`SELECT * FROM staff WHERE LOWER(username) = ? AND active = 1`)
+    .get(username.toLowerCase()) as any;
+
+  if (!user) {
+    return reply.code(404).send({ error: 'not_found' });
+  }
+
+  const hash = user.password_hash || '';
+  if (!hash || hash.startsWith('synced-from-bi') || hash.startsWith('pending-reset') || hash.endsWith(':0000')) {
+    return reply.code(403).send({ error: 'password_not_available', message: 'Password is managed externally' });
+  }
+
+  let ok = false;
+  try {
+    if (hash.includes(':')) {
+      const [salt, stored] = hash.split(':');
+      const candidate = crypto.scryptSync(password, salt, 64).toString('hex');
+      const a = Buffer.from(stored, 'hex');
+      const b = Buffer.from(candidate, 'hex');
+      ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+    } else if (hash.startsWith('$2a$') || hash.startsWith('$2b$')) {
+      const bcrypt = require('bcryptjs') as typeof import('bcryptjs');
+      ok = bcrypt.compareSync(password, hash);
+    } else {
+      ok = hash === password;
+    }
+  } catch {
+    ok = false;
+  }
+
+  if (!ok) {
+    return reply.code(401).send({ error: 'invalid_password' });
+  }
+
+  return reply.send({ ok: true, userId: user.id, username: user.username });
+}
+
 // ── Registrations ────────────────────────────────────────────
 
 const CreateRegSchema = z.object({
@@ -282,7 +405,7 @@ const CreateRegSchema = z.object({
   email: z.string().email(),
   username: z.string().min(3),
   passwordHash: z.string().min(1),
-  requestedRole: z.enum(['admin', 'editor', 'viewer']).optional(),
+  requestedRole: z.enum(['admin', 'editor', 'manager', 'viewer']).optional(),
 });
 
 export async function createRegistrationHandler(req: FastifyRequest, reply: FastifyReply) {
@@ -383,7 +506,7 @@ const UpdateRegSchema = z.object({
   phone: z.string().min(5).optional(),
   email: z.string().email().optional(),
   username: z.string().min(3).optional(),
-  requestedRole: z.enum(['admin', 'editor', 'viewer']).optional(),
+  requestedRole: z.enum(['admin', 'editor', 'manager', 'viewer']).optional(),
   note: z.string().optional(),
 });
 
@@ -434,7 +557,7 @@ const ResolveRegSchema = z.object({
   id: z.string().min(1),
   action: z.enum(['approve', 'reject']),
   note: z.string().optional(),
-  role: z.enum(['admin', 'editor', 'viewer']).optional(),
+  role: z.enum(['admin', 'editor', 'manager', 'viewer']).optional(),
   reviewedBy: z.string().optional(),
   firstName: z.string().optional(),
   lastName: z.string().optional(),
@@ -888,3 +1011,335 @@ export async function staffDeleteHandler(req: FastifyRequest, reply: FastifyRepl
 
   return reply.send({ ok: true, deleted: true, id: row.id, username: row.username });
 }
+
+// ── Device Management Handlers ──────────────────────────────────────────
+
+const DeviceRegisterSchema = z.object({
+  id: z.string().min(1),
+  token: z.string().min(1),
+  name: z.string().default(''),
+  hostname: z.string().default(''),
+  osPlatform: z.string().default(''),
+  osRelease: z.string().default(''),
+  ramGb: z.number().default(0),
+  cpuModel: z.string().default(''),
+  macAddress: z.string().optional().default(''),
+  ipAddress: z.string().optional().default(''),
+  appVersion: z.string().optional().default('1.0.0'),
+});
+
+export async function deviceRegisterHandler(req: FastifyRequest, reply: FastifyReply) {
+  const parsed = DeviceRegisterSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+
+  const d = parsed.data;
+  const db = getDb();
+  const existing = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(d.id) as any;
+
+  if (existing) {
+    db.prepare(`
+      UPDATE devices
+      SET name = COALESCE(NULLIF(?, ''), name),
+          hostname = ?,
+          os_platform = ?,
+          os_release = ?,
+          ram_gb = ?,
+          cpu_model = ?,
+          mac_address = ?,
+          ip_address = ?,
+          app_version = ?,
+          last_seen_at = datetime('now'),
+          updated_at = datetime('now')
+      WHERE id = ?
+    `).run(
+      d.name || existing.name,
+      d.hostname,
+      d.osPlatform,
+      d.osRelease,
+      d.ramGb,
+      d.cpuModel,
+      d.macAddress,
+      d.ipAddress,
+      d.appVersion,
+      d.id
+    );
+  } else {
+    db.prepare(`
+      INSERT INTO devices (
+        id, token, name, hostname, os_platform, os_release,
+        ram_gb, cpu_model, mac_address, ip_address, tenant_id,
+        tenant_slug, status, app_version, last_seen_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', 'pending', ?, datetime('now'), datetime('now'), datetime('now'))
+    `).run(
+      d.id,
+      d.token,
+      d.name || d.hostname || 'Client Server',
+      d.hostname,
+      d.osPlatform,
+      d.osRelease,
+      d.ramGb,
+      d.cpuModel,
+      d.macAddress,
+      d.ipAddress,
+      d.appVersion
+    );
+    logSync('create', 'device', d.id, 'electron', { hostname: d.hostname, name: d.name });
+  }
+
+  const updated = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(d.id) as any;
+  let companyName = '';
+  if (updated.tenant_slug) {
+    const t = db.prepare(`SELECT name FROM tenants WHERE slug = ?`).get(updated.tenant_slug) as any;
+    if (t) companyName = t.name;
+  }
+
+  return reply.send({
+    ok: true,
+    id: updated.id,
+    token: updated.token,
+    status: updated.status,
+    tenantId: updated.tenant_id,
+    tenantSlug: updated.tenant_slug,
+    companyName,
+    name: updated.name,
+  });
+}
+
+export async function deviceStatusHandler(req: FastifyRequest, reply: FastifyReply) {
+  const query = req.query as { deviceId?: string; token?: string };
+  if (!query.deviceId) return reply.code(400).send({ error: 'deviceId query param is required' });
+
+  const db = getDb();
+  const row = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(query.deviceId) as any;
+  if (!row) {
+    return reply.code(404).send({ error: 'Device not found', status: 'not_found' });
+  }
+
+  db.prepare(`UPDATE devices SET last_seen_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`).run(query.deviceId);
+
+  const assignments = db.prepare(`
+    SELECT da.tenant_slug, t.name as tenant_name
+    FROM device_assignments da
+    LEFT JOIN tenants t ON da.tenant_slug = t.slug
+    WHERE da.device_id = ?
+  `).all(query.deviceId) as any[];
+
+  const companySlugs = assignments.map((a) => a.tenant_slug);
+  const companyNames = assignments.map((a) => a.tenant_name);
+
+  let companyName = '';
+  if (row.tenant_slug) {
+    const t = db.prepare(`SELECT name FROM tenants WHERE slug = ?`).get(row.tenant_slug) as any;
+    if (t) companyName = t.name;
+  }
+
+  return reply.send({
+    ok: true,
+    id: row.id,
+    status: row.status,
+    tenantId: row.tenant_id,
+    tenantSlug: row.tenant_slug,
+    companyName,
+    companySlugs,
+    companyNames,
+    name: row.name,
+    hostname: row.hostname,
+  });
+}
+
+export async function listDevicesHandler(_req: FastifyRequest, reply: FastifyReply) {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT d.*, 
+      t.name as company_name, 
+      t.slug as company_slug,
+      GROUP_CONCAT(DISTINCT da.tenant_slug) as all_tenant_slugs,
+      GROUP_CONCAT(DISTINCT tn.name) as all_tenant_names
+    FROM devices d
+    LEFT JOIN tenants t ON d.tenant_slug = t.slug
+    LEFT JOIN device_assignments da ON d.id = da.device_id
+    LEFT JOIN tenants tn ON da.tenant_slug = tn.slug
+    GROUP BY d.id
+    ORDER BY d.created_at DESC
+  `).all() as any[];
+
+  const devices = rows.map((r) => {
+    const companySlugs = r.all_tenant_slugs ? r.all_tenant_slugs.split(',') : (r.company_slug ? [r.company_slug] : []);
+    const companyNames = r.all_tenant_names ? r.all_tenant_names.split(',') : (r.company_name ? [r.company_name] : []);
+    return {
+      id: r.id,
+      name: r.name,
+      hostname: r.hostname,
+      osPlatform: r.os_platform,
+      osRelease: r.os_release,
+      ramGb: r.ram_gb,
+      cpuModel: r.cpu_model,
+      macAddress: r.mac_address,
+      ipAddress: r.ip_address,
+      tenantId: r.tenant_id,
+      tenantSlug: r.tenant_slug || r.company_slug || '',
+      companyName: r.company_name || '',
+      companySlugs,
+      companyNames,
+      status: r.status,
+      appVersion: r.app_version,
+      lastSeenAt: r.last_seen_at,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    };
+  });
+
+  return reply.send({ ok: true, devices });
+}
+
+export async function approveDeviceHandler(req: FastifyRequest, reply: FastifyReply) {
+  const params = req.params as { id: string };
+  const body = req.body as { tenantSlugs?: string[]; tenantSlug?: string; name?: string };
+
+  if (!params.id) {
+    return reply.code(400).send({ error: 'Device id is required' });
+  }
+
+  const tenantSlugs: string[] = Array.isArray(body.tenantSlugs)
+    ? body.tenantSlugs.filter(Boolean)
+    : body.tenantSlug
+      ? [body.tenantSlug]
+      : [];
+
+  if (tenantSlugs.length === 0) {
+    return reply.code(400).send({ error: 'At least one tenantSlug is required' });
+  }
+
+  const db = getDb();
+  const placeholders = tenantSlugs.map(() => '?').join(',');
+  const tenants = db.prepare(`SELECT * FROM tenants WHERE slug IN (${placeholders})`).all(...tenantSlugs) as any[];
+  if (tenants.length === 0) {
+    return reply.code(404).send({ error: 'Company (tenant) not found' });
+  }
+
+  const device = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(params.id) as any;
+  if (!device) return reply.code(404).send({ error: 'Device not found' });
+
+  const primaryTenant = tenants[0];
+
+  db.prepare(`DELETE FROM device_assignments WHERE device_id = ?`).run(params.id);
+
+  db.prepare(`
+    UPDATE devices
+    SET tenant_id = ?,
+        tenant_slug = ?,
+        status = 'approved',
+        name = COALESCE(NULLIF(?, ''), name),
+        updated_at = datetime('now')
+    WHERE id = ?
+  `).run(primaryTenant.id, primaryTenant.slug, body.name || '', params.id);
+
+  const now = new Date().toISOString();
+  const insertAssignment = db.prepare(`
+    INSERT INTO device_assignments (id, device_id, tenant_slug, endpoint_id, description, created_at, updated_at)
+    VALUES (?, ?, ?, NULL, '', ?, ?)
+  `);
+
+  for (const tenant of tenants) {
+    const assignmentId = crypto.randomUUID();
+    insertAssignment.run(assignmentId, params.id, tenant.slug, now, now);
+  }
+
+  logSync('approve', 'device', params.id, 'bi_admin', { tenantSlugs: tenants.map((t) => t.slug) });
+
+  const updated = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(params.id) as any;
+  return reply.send({
+    ok: true,
+    device: {
+      id: updated.id,
+      name: updated.name,
+      tenantId: updated.tenant_id,
+      tenantSlug: updated.tenant_slug,
+      companyName: primaryTenant.name,
+      companyNames: tenants.map((t) => t.name),
+      companySlugs: tenants.map((t) => t.slug),
+      status: updated.status,
+    },
+  });
+}
+
+export async function updateDeviceStatusHandler(req: FastifyRequest, reply: FastifyReply) {
+  const params = req.params as { id: string };
+  const body = req.body as {
+    status: 'pending' | 'approved' | 'blocked';
+    tenantSlug?: string;
+    tenantSlugs?: string[];
+    name?: string;
+  };
+
+  const db = getDb();
+  const device = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(params.id) as any;
+  if (!device) return reply.code(404).send({ error: 'Device not found' });
+
+  if (body.status === 'approved' && !body.tenantSlug && !body.tenantSlugs?.length && !device.tenant_slug) {
+    return reply.code(400).send({ error: 'tenantSlug is required to approve a device' });
+  }
+
+  const tenantSlugs: string[] = Array.isArray(body.tenantSlugs)
+    ? body.tenantSlugs.filter(Boolean)
+    : body.tenantSlug
+      ? [body.tenantSlug]
+      : device.tenant_slug
+        ? [device.tenant_slug]
+        : [];
+
+  let tenantId = device.tenant_id;
+  let tenantSlug = device.tenant_slug;
+
+  if (tenantSlugs.length > 0) {
+    const placeholders = tenantSlugs.map(() => '?').join(',');
+    const tenants = db.prepare(`SELECT * FROM tenants WHERE slug IN (${placeholders})`).all(...tenantSlugs) as any[];
+    if (tenants.length > 0) {
+      tenantId = tenants[0].id;
+      tenantSlug = tenants[0].slug;
+    }
+  }
+
+  if (body.status === 'approved' && tenantSlugs.length > 0) {
+    const existingSlugs = db.prepare(`SELECT tenant_slug FROM device_assignments WHERE device_id = ?`).all(params.id) as any[];
+    const existingSet = new Set(existingSlugs.map((r) => r.tenant_slug));
+    const newSlugs = tenantSlugs.filter((s) => !existingSet.has(s));
+    if (newSlugs.length > 0) {
+      const now = new Date().toISOString();
+      const insertAssignment = db.prepare(`
+        INSERT INTO device_assignments (id, device_id, tenant_slug, endpoint_id, description, created_at, updated_at)
+        VALUES (?, ?, ?, NULL, '', ?, ?)
+      `);
+      for (const slug of newSlugs) {
+        insertAssignment.run(crypto.randomUUID(), params.id, slug, now, now);
+      }
+    }
+  }
+
+  db.prepare(`
+    UPDATE devices
+    SET status = COALESCE(?, status),
+        tenant_id = ?,
+        tenant_slug = ?,
+        name = COALESCE(NULLIF(?, ''), name),
+        updated_at = datetime('now')
+    WHERE id = ?
+  `).run(body.status, tenantId, tenantSlug, body.name || '', params.id);
+
+  logSync('update', 'device', params.id, 'bi_admin', { status: body.status, tenantSlugs });
+
+  return reply.send({ ok: true, status: body.status, tenantSlugs });
+}
+
+export async function deleteDeviceHandler(req: FastifyRequest, reply: FastifyReply) {
+  const params = req.params as { id: string };
+  const db = getDb();
+  const device = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(params.id) as any;
+  if (!device) return reply.code(404).send({ error: 'Device not found' });
+
+  db.prepare(`DELETE FROM devices WHERE id = ?`).run(params.id);
+  logSync('delete', 'device', params.id, 'bi_admin', { hostname: device.hostname });
+
+  return reply.send({ ok: true, deleted: true, id: params.id });
+}
+

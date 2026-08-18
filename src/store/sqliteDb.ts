@@ -13,7 +13,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { env } from '../config/env';
 
-const CURRENT_SCHEMA_VERSION = 2;
+const CURRENT_SCHEMA_VERSION = 4;
 
 // Resolve DB path: same directory as the old JSON, but .sqlite extension
 const dbDir = path.dirname(path.resolve(env.DB_FILE));
@@ -168,6 +168,8 @@ function applySchema(db: Database.Database) {
   ).run(Math.max(1, getSchemaVersion(db)));
 
   migrateToV2(db);
+  migrateToV3(db);
+  migrateToV4(db);
 }
 
 /** v2: edit locks (is_open) on tenants / staff / endpoints */
@@ -193,6 +195,84 @@ function migrateToV2(db: Database.Database) {
 
   db.prepare(
     `INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (2, datetime('now'))`
+  ).run();
+}
+
+/** v3: devices table for multi-tenant hardware registration and approval */
+function migrateToV3(db: Database.Database) {
+  const ver = getSchemaVersion(db);
+  if (ver >= 3) return;
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS devices (
+      id TEXT PRIMARY KEY,
+      token TEXT NOT NULL,
+      name TEXT NOT NULL,
+      hostname TEXT NOT NULL,
+      os_platform TEXT NOT NULL,
+      os_release TEXT NOT NULL,
+      ram_gb REAL NOT NULL,
+      cpu_model TEXT NOT NULL,
+      mac_address TEXT DEFAULT '',
+      ip_address TEXT DEFAULT '',
+      tenant_id TEXT,
+      tenant_slug TEXT DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending',
+      app_version TEXT DEFAULT '1.0.0',
+      last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_devices_tenant ON devices(tenant_slug);
+    CREATE INDEX IF NOT EXISTS idx_devices_status ON devices(status);
+  `);
+
+  db.prepare(
+    `INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (3, datetime('now'))`
+  ).run();
+}
+
+/** v4: improved relationships, indexes, and device assignment tracking */
+function migrateToV4(db: Database.Database) {
+  const ver = getSchemaVersion(db);
+  if (ver >= 4) return;
+
+  const cols = (table: string) =>
+    (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((r) => r.name);
+
+  // Add tenant_id foreign key reference to devices (SQLite doesn't enforce FK on ALTER, but we add the column)
+  if (!cols('devices').includes('assigned_by')) {
+    db.exec(`ALTER TABLE devices ADD COLUMN assigned_by TEXT DEFAULT ''`);
+  }
+  if (!cols('devices').includes('assigned_at')) {
+    db.exec(`ALTER TABLE devices ADD COLUMN assigned_at TEXT`);
+  }
+
+  // Add indexes for common queries
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_devices_tenant_id ON devices(tenant_id);
+    CREATE INDEX IF NOT EXISTS idx_devices_last_seen ON devices(last_seen_at);
+    CREATE INDEX IF NOT EXISTS idx_endpoints_tenant_slug ON endpoints(tenant_slug);
+    CREATE INDEX IF NOT EXISTS idx_staff_active ON staff(active);
+  `);
+
+  // Create device_assignments table for tracking endpoint-device relationships
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS device_assignments (
+      id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      tenant_slug TEXT NOT NULL,
+      endpoint_id TEXT,
+      description TEXT DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_device_assignments_device ON device_assignments(device_id);
+    CREATE INDEX IF NOT EXISTS idx_device_assignments_tenant ON device_assignments(tenant_slug);
+  `);
+
+  db.prepare(
+    `INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (4, datetime('now'))`
   ).run();
 }
 
@@ -383,10 +463,10 @@ function migrateFromJson(db: Database.Database) {
 // ---------------------------------------------------------------------------
 
 export function logSync(
-  action: 'create' | 'update' | 'delete' | 'sync',
-  entityType: 'tenant' | 'staff' | 'endpoint' | 'connection' | 'registration' | 'notification',
+  action: 'create' | 'update' | 'delete' | 'sync' | 'approve',
+  entityType: 'tenant' | 'staff' | 'endpoint' | 'connection' | 'registration' | 'notification' | 'device',
   entityId: string | null,
-  source: 'electron' | 'bi' | 'vps' | 'api',
+  source: 'electron' | 'bi' | 'vps' | 'api' | 'bi_admin',
   details?: Record<string, unknown>
 ) {
   const db = getDb();

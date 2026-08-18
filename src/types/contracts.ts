@@ -65,7 +65,7 @@ export interface ApiKeyRecord {
 }
 
 /** Staff synced from Electron admin apps → used by BI Platform login */
-export type StaffRole = 'admin' | 'editor' | 'viewer';
+export type StaffRole = 'viewer' | 'editor' | 'manager' | 'admin';
 
 export interface StaffRecord {
   id: string;
@@ -111,6 +111,28 @@ export interface RegistrationRecord {
   createdAt: string;
 }
 
+export type DeviceStatus = 'pending' | 'approved' | 'blocked';
+
+export interface DeviceRecord {
+  id: string;
+  token: string;
+  name: string;
+  hostname: string;
+  osPlatform: string;
+  osRelease: string;
+  ramGb: number;
+  cpuModel: string;
+  macAddress?: string;
+  ipAddress?: string;
+  tenantId?: string;
+  tenantSlug?: string;
+  status: DeviceStatus;
+  appVersion: string;
+  lastSeenAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 /** Simple user-facing notification (approve/reject) */
 export interface UserNotification {
   id: string;
@@ -121,3 +143,5 @@ export interface UserNotification {
   read: boolean;
   createdAt: string;
 }
+
+

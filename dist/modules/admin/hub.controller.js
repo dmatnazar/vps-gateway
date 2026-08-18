@@ -37,8 +37,10 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.catalogHandler = catalogHandler;
+exports.createTenantHandler = createTenantHandler;
 exports.syncStaffHandler = syncStaffHandler;
 exports.staffLookupHandler = staffLookupHandler;
+exports.staffVerifyHandler = staffVerifyHandler;
 exports.createRegistrationHandler = createRegistrationHandler;
 exports.getRegistrationHandler = getRegistrationHandler;
 exports.listRegistrationsHandler = listRegistrationsHandler;
@@ -51,6 +53,12 @@ exports.endpointUpdateHandler = endpointUpdateHandler;
 exports.entityLockHandler = entityLockHandler;
 exports.tenantDeleteHandler = tenantDeleteHandler;
 exports.staffDeleteHandler = staffDeleteHandler;
+exports.deviceRegisterHandler = deviceRegisterHandler;
+exports.deviceStatusHandler = deviceStatusHandler;
+exports.listDevicesHandler = listDevicesHandler;
+exports.approveDeviceHandler = approveDeviceHandler;
+exports.updateDeviceStatusHandler = updateDeviceStatusHandler;
+exports.deleteDeviceHandler = deleteDeviceHandler;
 const zod_1 = require("zod");
 const node_crypto_1 = __importDefault(require("node:crypto"));
 const sqliteDb_1 = require("../../store/sqliteDb");
@@ -96,12 +104,74 @@ async function catalogHandler(_req, reply) {
         passwordEnc: s.password_enc,
         updatedAt: s.updated_at,
     }));
+    const deviceRows = db.prepare(`
+    SELECT d.*, t.name as company_name, t.slug as company_slug,
+      GROUP_CONCAT(DISTINCT da.tenant_slug) as all_tenant_slugs,
+      GROUP_CONCAT(DISTINCT tn.name) as all_tenant_names
+    FROM devices d
+    LEFT JOIN tenants t ON d.tenant_slug = t.slug
+    LEFT JOIN device_assignments da ON d.id = da.device_id
+    LEFT JOIN tenants tn ON da.tenant_slug = tn.slug
+    GROUP BY d.id
+    ORDER BY d.created_at DESC
+  `).all();
+    const devices = deviceRows.map((d) => {
+        const companySlugs = d.all_tenant_slugs ? d.all_tenant_slugs.split(',') : (d.company_slug ? [d.company_slug] : []);
+        const companyNames = d.all_tenant_names ? d.all_tenant_names.split(',') : (d.company_name ? [d.company_name] : []);
+        return {
+            id: d.id,
+            name: d.name,
+            hostname: d.hostname,
+            osPlatform: d.os_platform,
+            osRelease: d.os_release,
+            ramGb: d.ram_gb,
+            cpuModel: d.cpu_model,
+            macAddress: d.mac_address,
+            ipAddress: d.ip_address,
+            tenantId: d.tenant_id,
+            tenantSlug: d.tenant_slug || d.company_slug || '',
+            companyName: d.company_name || '',
+            companySlugs,
+            companyNames,
+            status: d.status,
+            appVersion: d.app_version,
+            lastSeenAt: d.last_seen_at,
+            createdAt: d.created_at,
+            updatedAt: d.updated_at,
+        };
+    });
     return reply.send({
         tenants,
         endpoints,
         staff,
+        devices,
         syncedAt: new Date().toISOString(),
     });
+}
+// ── Tenant (Company) CRUD ─────────────────────────────────────
+const CreateTenantSchema = zod_1.z.object({
+    slug: zod_1.z.string().min(1).max(100).regex(/^[a-z0-9-]+$/),
+    name: zod_1.z.string().min(1).max(200),
+});
+async function createTenantHandler(req, reply) {
+    const parsed = CreateTenantSchema.safeParse(req.body);
+    if (!parsed.success) {
+        return reply.code(400).send({ error: parsed.error.flatten() });
+    }
+    const { slug, name } = parsed.data;
+    const db = (0, sqliteDb_1.getDb)();
+    const existing = db.prepare(`SELECT id FROM tenants WHERE slug = ?`).get(slug);
+    if (existing) {
+        return reply.code(409).send({ error: `Tenant "${slug}" already exists`, tenantId: existing.id });
+    }
+    const now = new Date().toISOString();
+    const id = node_crypto_1.default.randomUUID();
+    db.prepare(`
+    INSERT INTO tenants (id, slug, name, is_active, created_at, updated_at)
+    VALUES (?, ?, ?, 1, ?, ?)
+  `).run(id, slug, name, now, now);
+    (0, sqliteDb_1.logSync)('create', 'tenant', id, 'bi_admin', { slug, name });
+    return reply.send({ ok: true, tenant: { id, slug, name, isActive: true, createdAt: now, updatedAt: now } });
 }
 // ── Staff sync ───────────────────────────────────────────────
 const StaffSyncSchema = zod_1.z.object({
@@ -111,7 +181,7 @@ const StaffSyncSchema = zod_1.z.object({
         fullName: zod_1.z.string().min(1),
         username: zod_1.z.string().min(1),
         passwordHash: zod_1.z.string().min(1),
-        role: zod_1.z.enum(['admin', 'editor', 'viewer']),
+        role: zod_1.z.enum(['admin', 'editor', 'manager', 'viewer']),
         tenantSlugs: zod_1.z.array(zod_1.z.string()).optional(),
         phone: zod_1.z.string().optional(),
         email: zod_1.z.string().optional(),
@@ -203,6 +273,10 @@ async function syncStaffHandler(req, reply) {
 const AuthLookupSchema = zod_1.z.object({
     username: zod_1.z.string().min(1),
 });
+const StaffVerifySchema = zod_1.z.object({
+    username: zod_1.z.string().min(1),
+    password: zod_1.z.string().min(1),
+});
 async function staffLookupHandler(req, reply) {
     const parsed = AuthLookupSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -274,6 +348,48 @@ async function staffLookupHandler(req, reply) {
         active: Boolean(user.active),
     });
 }
+async function staffVerifyHandler(req, reply) {
+    const parsed = StaffVerifySchema.safeParse(req.body);
+    if (!parsed.success) {
+        return reply.code(400).send({ error: parsed.error.flatten() });
+    }
+    const { username, password } = parsed.data;
+    const db = (0, sqliteDb_1.getDb)();
+    const user = db
+        .prepare(`SELECT * FROM staff WHERE LOWER(username) = ? AND active = 1`)
+        .get(username.toLowerCase());
+    if (!user) {
+        return reply.code(404).send({ error: 'not_found' });
+    }
+    const hash = user.password_hash || '';
+    if (!hash || hash.startsWith('synced-from-bi') || hash.startsWith('pending-reset') || hash.endsWith(':0000')) {
+        return reply.code(403).send({ error: 'password_not_available', message: 'Password is managed externally' });
+    }
+    let ok = false;
+    try {
+        if (hash.includes(':')) {
+            const [salt, stored] = hash.split(':');
+            const candidate = node_crypto_1.default.scryptSync(password, salt, 64).toString('hex');
+            const a = Buffer.from(stored, 'hex');
+            const b = Buffer.from(candidate, 'hex');
+            ok = a.length === b.length && node_crypto_1.default.timingSafeEqual(a, b);
+        }
+        else if (hash.startsWith('$2a$') || hash.startsWith('$2b$')) {
+            const bcrypt = require('bcryptjs');
+            ok = bcrypt.compareSync(password, hash);
+        }
+        else {
+            ok = hash === password;
+        }
+    }
+    catch {
+        ok = false;
+    }
+    if (!ok) {
+        return reply.code(401).send({ error: 'invalid_password' });
+    }
+    return reply.send({ ok: true, userId: user.id, username: user.username });
+}
 // ── Registrations ────────────────────────────────────────────
 const CreateRegSchema = zod_1.z.object({
     tenantSlug: zod_1.z.string().min(1),
@@ -283,7 +399,7 @@ const CreateRegSchema = zod_1.z.object({
     email: zod_1.z.string().email(),
     username: zod_1.z.string().min(3),
     passwordHash: zod_1.z.string().min(1),
-    requestedRole: zod_1.z.enum(['admin', 'editor', 'viewer']).optional(),
+    requestedRole: zod_1.z.enum(['admin', 'editor', 'manager', 'viewer']).optional(),
 });
 async function createRegistrationHandler(req, reply) {
     const parsed = CreateRegSchema.safeParse(req.body);
@@ -368,7 +484,7 @@ const UpdateRegSchema = zod_1.z.object({
     phone: zod_1.z.string().min(5).optional(),
     email: zod_1.z.string().email().optional(),
     username: zod_1.z.string().min(3).optional(),
-    requestedRole: zod_1.z.enum(['admin', 'editor', 'viewer']).optional(),
+    requestedRole: zod_1.z.enum(['admin', 'editor', 'manager', 'viewer']).optional(),
     note: zod_1.z.string().optional(),
 });
 async function updateRegistrationHandler(req, reply) {
@@ -403,7 +519,7 @@ const ResolveRegSchema = zod_1.z.object({
     id: zod_1.z.string().min(1),
     action: zod_1.z.enum(['approve', 'reject']),
     note: zod_1.z.string().optional(),
-    role: zod_1.z.enum(['admin', 'editor', 'viewer']).optional(),
+    role: zod_1.z.enum(['admin', 'editor', 'manager', 'viewer']).optional(),
     reviewedBy: zod_1.z.string().optional(),
     firstName: zod_1.z.string().optional(),
     lastName: zod_1.z.string().optional(),
@@ -760,5 +876,273 @@ async function staffDeleteHandler(req, reply) {
     db.prepare(`DELETE FROM staff WHERE id = ?`).run(row.id);
     (0, sqliteDb_1.logSync)('delete', 'staff', row.id, 'electron', { username: row.username });
     return reply.send({ ok: true, deleted: true, id: row.id, username: row.username });
+}
+// ── Device Management Handlers ──────────────────────────────────────────
+const DeviceRegisterSchema = zod_1.z.object({
+    id: zod_1.z.string().min(1),
+    token: zod_1.z.string().min(1),
+    name: zod_1.z.string().default(''),
+    hostname: zod_1.z.string().default(''),
+    osPlatform: zod_1.z.string().default(''),
+    osRelease: zod_1.z.string().default(''),
+    ramGb: zod_1.z.number().default(0),
+    cpuModel: zod_1.z.string().default(''),
+    macAddress: zod_1.z.string().optional().default(''),
+    ipAddress: zod_1.z.string().optional().default(''),
+    appVersion: zod_1.z.string().optional().default('1.0.0'),
+});
+async function deviceRegisterHandler(req, reply) {
+    const parsed = DeviceRegisterSchema.safeParse(req.body);
+    if (!parsed.success)
+        return reply.code(400).send({ error: parsed.error.flatten() });
+    const d = parsed.data;
+    const db = (0, sqliteDb_1.getDb)();
+    const existing = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(d.id);
+    if (existing) {
+        db.prepare(`
+      UPDATE devices
+      SET name = COALESCE(NULLIF(?, ''), name),
+          hostname = ?,
+          os_platform = ?,
+          os_release = ?,
+          ram_gb = ?,
+          cpu_model = ?,
+          mac_address = ?,
+          ip_address = ?,
+          app_version = ?,
+          last_seen_at = datetime('now'),
+          updated_at = datetime('now')
+      WHERE id = ?
+    `).run(d.name || existing.name, d.hostname, d.osPlatform, d.osRelease, d.ramGb, d.cpuModel, d.macAddress, d.ipAddress, d.appVersion, d.id);
+    }
+    else {
+        db.prepare(`
+      INSERT INTO devices (
+        id, token, name, hostname, os_platform, os_release,
+        ram_gb, cpu_model, mac_address, ip_address, tenant_id,
+        tenant_slug, status, app_version, last_seen_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', 'pending', ?, datetime('now'), datetime('now'), datetime('now'))
+    `).run(d.id, d.token, d.name || d.hostname || 'Client Server', d.hostname, d.osPlatform, d.osRelease, d.ramGb, d.cpuModel, d.macAddress, d.ipAddress, d.appVersion);
+        (0, sqliteDb_1.logSync)('create', 'device', d.id, 'electron', { hostname: d.hostname, name: d.name });
+    }
+    const updated = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(d.id);
+    let companyName = '';
+    if (updated.tenant_slug) {
+        const t = db.prepare(`SELECT name FROM tenants WHERE slug = ?`).get(updated.tenant_slug);
+        if (t)
+            companyName = t.name;
+    }
+    return reply.send({
+        ok: true,
+        id: updated.id,
+        token: updated.token,
+        status: updated.status,
+        tenantId: updated.tenant_id,
+        tenantSlug: updated.tenant_slug,
+        companyName,
+        name: updated.name,
+    });
+}
+async function deviceStatusHandler(req, reply) {
+    const query = req.query;
+    if (!query.deviceId)
+        return reply.code(400).send({ error: 'deviceId query param is required' });
+    const db = (0, sqliteDb_1.getDb)();
+    const row = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(query.deviceId);
+    if (!row) {
+        return reply.code(404).send({ error: 'Device not found', status: 'not_found' });
+    }
+    db.prepare(`UPDATE devices SET last_seen_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`).run(query.deviceId);
+    const assignments = db.prepare(`
+    SELECT da.tenant_slug, t.name as tenant_name
+    FROM device_assignments da
+    LEFT JOIN tenants t ON da.tenant_slug = t.slug
+    WHERE da.device_id = ?
+  `).all(query.deviceId);
+    const companySlugs = assignments.map((a) => a.tenant_slug);
+    const companyNames = assignments.map((a) => a.tenant_name);
+    let companyName = '';
+    if (row.tenant_slug) {
+        const t = db.prepare(`SELECT name FROM tenants WHERE slug = ?`).get(row.tenant_slug);
+        if (t)
+            companyName = t.name;
+    }
+    return reply.send({
+        ok: true,
+        id: row.id,
+        status: row.status,
+        tenantId: row.tenant_id,
+        tenantSlug: row.tenant_slug,
+        companyName,
+        companySlugs,
+        companyNames,
+        name: row.name,
+        hostname: row.hostname,
+    });
+}
+async function listDevicesHandler(_req, reply) {
+    const db = (0, sqliteDb_1.getDb)();
+    const rows = db.prepare(`
+    SELECT d.*, 
+      t.name as company_name, 
+      t.slug as company_slug,
+      GROUP_CONCAT(DISTINCT da.tenant_slug) as all_tenant_slugs,
+      GROUP_CONCAT(DISTINCT tn.name) as all_tenant_names
+    FROM devices d
+    LEFT JOIN tenants t ON d.tenant_slug = t.slug
+    LEFT JOIN device_assignments da ON d.id = da.device_id
+    LEFT JOIN tenants tn ON da.tenant_slug = tn.slug
+    GROUP BY d.id
+    ORDER BY d.created_at DESC
+  `).all();
+    const devices = rows.map((r) => {
+        const companySlugs = r.all_tenant_slugs ? r.all_tenant_slugs.split(',') : (r.company_slug ? [r.company_slug] : []);
+        const companyNames = r.all_tenant_names ? r.all_tenant_names.split(',') : (r.company_name ? [r.company_name] : []);
+        return {
+            id: r.id,
+            name: r.name,
+            hostname: r.hostname,
+            osPlatform: r.os_platform,
+            osRelease: r.os_release,
+            ramGb: r.ram_gb,
+            cpuModel: r.cpu_model,
+            macAddress: r.mac_address,
+            ipAddress: r.ip_address,
+            tenantId: r.tenant_id,
+            tenantSlug: r.tenant_slug || r.company_slug || '',
+            companyName: r.company_name || '',
+            companySlugs,
+            companyNames,
+            status: r.status,
+            appVersion: r.app_version,
+            lastSeenAt: r.last_seen_at,
+            createdAt: r.created_at,
+            updatedAt: r.updated_at,
+        };
+    });
+    return reply.send({ ok: true, devices });
+}
+async function approveDeviceHandler(req, reply) {
+    const params = req.params;
+    const body = req.body;
+    if (!params.id) {
+        return reply.code(400).send({ error: 'Device id is required' });
+    }
+    const tenantSlugs = Array.isArray(body.tenantSlugs)
+        ? body.tenantSlugs.filter(Boolean)
+        : body.tenantSlug
+            ? [body.tenantSlug]
+            : [];
+    if (tenantSlugs.length === 0) {
+        return reply.code(400).send({ error: 'At least one tenantSlug is required' });
+    }
+    const db = (0, sqliteDb_1.getDb)();
+    const placeholders = tenantSlugs.map(() => '?').join(',');
+    const tenants = db.prepare(`SELECT * FROM tenants WHERE slug IN (${placeholders})`).all(...tenantSlugs);
+    if (tenants.length === 0) {
+        return reply.code(404).send({ error: 'Company (tenant) not found' });
+    }
+    const device = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(params.id);
+    if (!device)
+        return reply.code(404).send({ error: 'Device not found' });
+    const primaryTenant = tenants[0];
+    db.prepare(`DELETE FROM device_assignments WHERE device_id = ?`).run(params.id);
+    db.prepare(`
+    UPDATE devices
+    SET tenant_id = ?,
+        tenant_slug = ?,
+        status = 'approved',
+        name = COALESCE(NULLIF(?, ''), name),
+        updated_at = datetime('now')
+    WHERE id = ?
+  `).run(primaryTenant.id, primaryTenant.slug, body.name || '', params.id);
+    const now = new Date().toISOString();
+    const insertAssignment = db.prepare(`
+    INSERT INTO device_assignments (id, device_id, tenant_slug, endpoint_id, description, created_at, updated_at)
+    VALUES (?, ?, ?, NULL, '', ?, ?)
+  `);
+    for (const tenant of tenants) {
+        const assignmentId = node_crypto_1.default.randomUUID();
+        insertAssignment.run(assignmentId, params.id, tenant.slug, now, now);
+    }
+    (0, sqliteDb_1.logSync)('approve', 'device', params.id, 'bi_admin', { tenantSlugs: tenants.map((t) => t.slug) });
+    const updated = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(params.id);
+    return reply.send({
+        ok: true,
+        device: {
+            id: updated.id,
+            name: updated.name,
+            tenantId: updated.tenant_id,
+            tenantSlug: updated.tenant_slug,
+            companyName: primaryTenant.name,
+            companyNames: tenants.map((t) => t.name),
+            companySlugs: tenants.map((t) => t.slug),
+            status: updated.status,
+        },
+    });
+}
+async function updateDeviceStatusHandler(req, reply) {
+    const params = req.params;
+    const body = req.body;
+    const db = (0, sqliteDb_1.getDb)();
+    const device = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(params.id);
+    if (!device)
+        return reply.code(404).send({ error: 'Device not found' });
+    if (body.status === 'approved' && !body.tenantSlug && !body.tenantSlugs?.length && !device.tenant_slug) {
+        return reply.code(400).send({ error: 'tenantSlug is required to approve a device' });
+    }
+    const tenantSlugs = Array.isArray(body.tenantSlugs)
+        ? body.tenantSlugs.filter(Boolean)
+        : body.tenantSlug
+            ? [body.tenantSlug]
+            : device.tenant_slug
+                ? [device.tenant_slug]
+                : [];
+    let tenantId = device.tenant_id;
+    let tenantSlug = device.tenant_slug;
+    if (tenantSlugs.length > 0) {
+        const placeholders = tenantSlugs.map(() => '?').join(',');
+        const tenants = db.prepare(`SELECT * FROM tenants WHERE slug IN (${placeholders})`).all(...tenantSlugs);
+        if (tenants.length > 0) {
+            tenantId = tenants[0].id;
+            tenantSlug = tenants[0].slug;
+        }
+    }
+    if (body.status === 'approved' && tenantSlugs.length > 0) {
+        const existingSlugs = db.prepare(`SELECT tenant_slug FROM device_assignments WHERE device_id = ?`).all(params.id);
+        const existingSet = new Set(existingSlugs.map((r) => r.tenant_slug));
+        const newSlugs = tenantSlugs.filter((s) => !existingSet.has(s));
+        if (newSlugs.length > 0) {
+            const now = new Date().toISOString();
+            const insertAssignment = db.prepare(`
+        INSERT INTO device_assignments (id, device_id, tenant_slug, endpoint_id, description, created_at, updated_at)
+        VALUES (?, ?, ?, NULL, '', ?, ?)
+      `);
+            for (const slug of newSlugs) {
+                insertAssignment.run(node_crypto_1.default.randomUUID(), params.id, slug, now, now);
+            }
+        }
+    }
+    db.prepare(`
+    UPDATE devices
+    SET status = COALESCE(?, status),
+        tenant_id = ?,
+        tenant_slug = ?,
+        name = COALESCE(NULLIF(?, ''), name),
+        updated_at = datetime('now')
+    WHERE id = ?
+  `).run(body.status, tenantId, tenantSlug, body.name || '', params.id);
+    (0, sqliteDb_1.logSync)('update', 'device', params.id, 'bi_admin', { status: body.status, tenantSlugs });
+    return reply.send({ ok: true, status: body.status, tenantSlugs });
+}
+async function deleteDeviceHandler(req, reply) {
+    const params = req.params;
+    const db = (0, sqliteDb_1.getDb)();
+    const device = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(params.id);
+    if (!device)
+        return reply.code(404).send({ error: 'Device not found' });
+    db.prepare(`DELETE FROM devices WHERE id = ?`).run(params.id);
+    (0, sqliteDb_1.logSync)('delete', 'device', params.id, 'bi_admin', { hostname: device.hostname });
+    return reply.send({ ok: true, deleted: true, id: params.id });
 }
 //# sourceMappingURL=hub.controller.js.map

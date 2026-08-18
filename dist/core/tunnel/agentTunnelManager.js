@@ -8,6 +8,8 @@ const node_crypto_1 = __importDefault(require("node:crypto"));
 class AgentTunnelManager {
     /** Map of tenantSlug -> Set of active AgentConnections */
     agents = new Map();
+    /** Round-robin index per tenant for load distribution */
+    roundRobinIndices = new Map();
     /** Map of requestId -> PendingRequest */
     pendingRequests = new Map();
     pingInterval = null;
@@ -155,8 +157,10 @@ class AgentTunnelManager {
                 error: `Ýerli Electron Agent birikdirilmedik ("${tenantSlug}"). Electron programmasyny ýerli kompýuterde işlediň.`,
             };
         }
-        // Select the first active connection (or round-robin)
-        const conn = activeConns[0];
+        // Select connection via round-robin for optimal load distribution
+        const currentIdx = (this.roundRobinIndices.get(tenantSlug) || 0) % activeConns.length;
+        this.roundRobinIndices.set(tenantSlug, currentIdx + 1);
+        const conn = activeConns[currentIdx];
         const requestId = 'rq_' + node_crypto_1.default.randomUUID();
         const timeoutMs = payload.timeoutMs || 35_000;
         return new Promise((resolve, reject) => {
