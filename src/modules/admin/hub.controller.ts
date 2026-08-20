@@ -986,6 +986,7 @@ export async function tenantDeleteHandler(req: FastifyRequest, reply: FastifyRep
   }
 
   db.prepare(`DELETE FROM tenant_connections WHERE tenant_id = ?`).run(t.id);
+  db.prepare(`DELETE FROM device_assignments WHERE tenant_slug = ?`).run(t.slug);
   db.prepare(`DELETE FROM tenants WHERE id = ?`).run(t.id);
   logSync('delete', 'tenant', t.id, 'electron', { slug: t.slug });
 
@@ -1372,13 +1373,25 @@ export async function updateDeviceStatusHandler(req: FastifyRequest, reply: Fast
     tenantSlug?: string;
     tenantSlugs?: string[];
     name?: string;
+    replaceAssignments?: boolean;
   };
+
+  const headerDeviceId = req.headers['x-device-id'];
+  if (headerDeviceId && typeof headerDeviceId === 'string' && headerDeviceId !== params.id) {
+    return reply.code(403).send({ error: 'Device can only update its own assignments' });
+  }
 
   const db = getDb();
   const device = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(params.id) as any;
   if (!device) return reply.code(404).send({ error: 'Device not found' });
 
-  if (body.status === 'approved' && !body.tenantSlug && !body.tenantSlugs?.length && !device.tenant_slug) {
+  if (
+    body.status === 'approved' &&
+    !body.replaceAssignments &&
+    !body.tenantSlug &&
+    !body.tenantSlugs?.length &&
+    !device.tenant_slug
+  ) {
     return reply.code(400).send({ error: 'tenantSlug is required to approve a device' });
   }
 
@@ -1402,12 +1415,21 @@ export async function updateDeviceStatusHandler(req: FastifyRequest, reply: Fast
     }
   }
 
-  if (body.status === 'approved' && tenantSlugs.length > 0) {
-    const existingSlugs = db.prepare(`SELECT tenant_slug FROM device_assignments WHERE device_id = ?`).all(params.id) as any[];
-    const existingSet = new Set(existingSlugs.map((r) => r.tenant_slug));
-    const newSlugs = tenantSlugs.filter((s) => !existingSet.has(s));
-    if (newSlugs.length > 0) {
-      const now = new Date().toISOString();
+  if (body.status === 'approved') {
+    const now = new Date().toISOString();
+    if (body.replaceAssignments) {
+      db.prepare(`DELETE FROM device_assignments WHERE device_id = ?`).run(params.id);
+      const insertAssignment = db.prepare(`
+        INSERT INTO device_assignments (id, device_id, tenant_slug, endpoint_id, description, created_at, updated_at)
+        VALUES (?, ?, ?, NULL, '', ?, ?)
+      `);
+      for (const slug of tenantSlugs) {
+        insertAssignment.run(randomId(), params.id, slug, now, now);
+      }
+    } else if (tenantSlugs.length > 0) {
+      const existingSlugs = db.prepare(`SELECT tenant_slug FROM device_assignments WHERE device_id = ?`).all(params.id) as any[];
+      const existingSet = new Set(existingSlugs.map((r) => r.tenant_slug));
+      const newSlugs = tenantSlugs.filter((s) => !existingSet.has(s));
       const insertAssignment = db.prepare(`
         INSERT INTO device_assignments (id, device_id, tenant_slug, endpoint_id, description, created_at, updated_at)
         VALUES (?, ?, ?, NULL, '', ?, ?)

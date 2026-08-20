@@ -57,7 +57,7 @@ export async function adminRoutes(app: FastifyInstance) {
   app.get('/api/admin/devices/status', { preHandler: [app.verifySyncSignature] }, deviceStatusHandler);
   app.get('/api/admin/devices', { preHandler: [app.verifyAdminSyncSignature] }, listDevicesHandler);
   app.post('/api/admin/devices/:id/approve', { preHandler: [app.verifyAdminSyncSignature] }, approveDeviceHandler);
-  app.patch('/api/admin/devices/:id/status', { preHandler: [app.verifyAdminSyncSignature] }, updateDeviceStatusHandler);
+  app.patch('/api/admin/devices/:id/status', { preHandler: [app.verifySyncSignature] }, updateDeviceStatusHandler);
   app.delete('/api/admin/devices/:id', { preHandler: [app.verifyAdminSyncSignature] }, deleteDeviceHandler);
 
   app.get('/api/admin/routes', async (_req, reply) => {

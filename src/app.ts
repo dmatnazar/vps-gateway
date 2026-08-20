@@ -53,14 +53,14 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   app.addHook('onRequest', async (req, reply) => {
     reply.header('Access-Control-Allow-Origin', '*');
-    reply.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+    reply.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
     reply.header(
       'Access-Control-Allow-Headers',
-      'Content-Type,X-Admin-Signature,Authorization,X-Api-Key'
+      'Content-Type,X-Admin-Signature,X-Device-Sync-Signature,X-Device-Id,Authorization,X-Api-Key'
     );
 
     if (req.method === 'OPTIONS') {
-      await reply.code(204).send();
+      return reply.code(204).send();
     }
   });
 
