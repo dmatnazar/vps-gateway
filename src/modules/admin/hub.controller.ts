@@ -1167,7 +1167,8 @@ export async function deviceStatusHandler(req: FastifyRequest, reply: FastifyRep
     return reply.code(404).send({ error: 'Device not found', status: 'not_found' });
   }
 
-  // Auth only after row exists (register is separate public endpoint)
+  // Auth: valid device-sig OR matching token (never fail signature before trying token —
+  // Electron may send local secret that differs from DB until approved/synced)
   const deviceSyncSecretHeader = (req.headers['x-device-sync-signature'] as string | undefined) || '';
   const deviceIdHeader = (req.headers['x-device-id'] as string | undefined) || '';
   let authed = false;
@@ -1182,16 +1183,26 @@ export async function deviceStatusHandler(req: FastifyRequest, reply: FastifyRep
     const expBuf = Buffer.from(expected);
     if (sigBuf.length === expBuf.length && crypto.timingSafeEqual(sigBuf, expBuf)) {
       authed = true;
-    } else {
-      return reply.code(403).send({ error: 'Invalid device sync signature', status: 'rejected' });
     }
-  } else if (query.token && row.token && String(query.token) === String(row.token)) {
+    // invalid signature → fall through to token auth (pending devices)
+  }
+
+  if (!authed && query.token && row.token && String(query.token) === String(row.token)) {
     authed = true;
+  }
+
+  // Also accept deviceId-only match for pending if token missing on old rows
+  if (!authed && row.status === 'pending' && query.deviceId === row.id) {
+    if (query.token && row.token && String(query.token) === String(row.token)) {
+      authed = true;
+    } else if (!row.token && query.deviceId) {
+      authed = true; // legacy rows without token
+    }
   }
 
   if (!authed) {
     return reply.code(401).send({
-      error: 'Unauthorized — provide device token query or valid X-Device-Sync-Signature',
+      error: 'Unauthorized — device token query param required (or valid X-Device-Sync-Signature)',
       status: 'unauthorized',
     });
   }

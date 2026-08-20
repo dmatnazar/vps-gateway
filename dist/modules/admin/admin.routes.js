@@ -24,8 +24,9 @@ async function adminRoutes(app) {
     app.post('/api/admin/staff-delete', { preHandler: [app.verifySyncSignature] }, hub_controller_1.staffDeleteHandler);
     app.post('/api/admin/entity-lock', { preHandler: [app.verifySyncSignature] }, hub_controller_1.entityLockHandler);
     // Device Management Routes
-    app.post('/api/admin/devices/register', { preHandler: [app.verifyAdminSyncSignature] }, hub_controller_1.deviceRegisterHandler);
-    app.get('/api/admin/devices/status', { preHandler: [app.verifySyncSignature] }, hub_controller_1.deviceStatusHandler);
+    // register + status: NO admin/device signature — Electron first-write then poll (pending devices have no approved secret yet)
+    app.post('/api/admin/devices/register', hub_controller_1.deviceRegisterHandler);
+    app.get('/api/admin/devices/status', hub_controller_1.deviceStatusHandler);
     app.get('/api/admin/devices', { preHandler: [app.verifyAdminSyncSignature] }, hub_controller_1.listDevicesHandler);
     app.post('/api/admin/devices/:id/approve', { preHandler: [app.verifyAdminSyncSignature] }, hub_controller_1.approveDeviceHandler);
     app.patch('/api/admin/devices/:id/status', { preHandler: [app.verifyAdminSyncSignature] }, hub_controller_1.updateDeviceStatusHandler);
