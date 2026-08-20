@@ -382,23 +382,9 @@ export async function staffVerifyHandler(req: FastifyRequest, reply: FastifyRepl
     return reply.code(403).send({ error: 'password_not_available', message: 'Password is managed externally' });
   }
 
-  let ok = false;
-  try {
-    if (hash.includes(':')) {
-      const [salt, stored] = hash.split(':');
-      const candidate = crypto.scryptSync(password, salt, 64).toString('hex');
-      const a = Buffer.from(stored, 'hex');
-      const b = Buffer.from(candidate, 'hex');
-      ok = a.length === b.length && crypto.timingSafeEqual(a, b);
-    } else if (hash.startsWith('$2a$') || hash.startsWith('$2b$')) {
-      const bcrypt = require('bcryptjs') as typeof import('bcryptjs');
-      ok = bcrypt.compareSync(password, hash);
-    } else {
-      ok = hash === password;
-    }
-  } catch {
-    ok = false;
-  }
+  // Same dual-salt scrypt + bcrypt path as public /api/auth/verify
+  const { verifyPasswordSync } = await import('../../core/workers/passwordWorker');
+  const ok = verifyPasswordSync(password, hash);
 
   if (!ok) {
     return reply.code(401).send({ error: 'invalid_password' });
