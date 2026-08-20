@@ -45,19 +45,25 @@ export async function agentRoutes(app: FastifyInstance) {
         }
       }
 
-      // Check device signature: HMAC-SHA256(deviceId) signed with device's sync secret
-      // Device must be approved + assigned to this tenantSlug (or primary tenant_slug)
+      // Device HMAC: JSON.stringify({ deviceId }) ýa-da plain deviceId (compatible)
       if (!authorized && deviceSignature && deviceId) {
         const db = getDb();
         const device = db
           .prepare(`SELECT id, status, tenant_slug, device_sync_secret FROM devices WHERE id = ?`)
           .get(deviceId) as any;
         if (device && device.device_sync_secret) {
-          const expected = crypto
-            .createHmac('sha256', device.device_sync_secret)
+          const secret = String(device.device_sync_secret).trim();
+          const expectedJson = crypto
+            .createHmac('sha256', secret)
             .update(JSON.stringify({ deviceId }))
             .digest('hex');
-          if (deviceSignature === expected) {
+          const expectedPlain = crypto.createHmac('sha256', secret).update(deviceId).digest('hex');
+          const sigOk =
+            deviceSignature === expectedJson ||
+            deviceSignature === expectedPlain ||
+            deviceSignature.toLowerCase() === expectedJson.toLowerCase();
+
+          if (sigOk) {
             if (device.status !== 'approved') {
               console.warn('[AgentWS] device not approved', { deviceId, status: device.status, tenantSlug });
               try {
@@ -75,7 +81,9 @@ export async function agentRoutes(app: FastifyInstance) {
               return;
             }
             const assigned = db
-              .prepare(`SELECT 1 as ok FROM device_assignments WHERE device_id = ? AND tenant_slug = ? LIMIT 1`)
+              .prepare(
+                `SELECT 1 as ok FROM device_assignments WHERE device_id = ? AND tenant_slug = ? LIMIT 1`
+              )
               .get(deviceId, tenantSlug) as any;
             const primaryOk = device.tenant_slug && String(device.tenant_slug) === tenantSlug;
             if (!assigned && !primaryOk) {
@@ -95,8 +103,15 @@ export async function agentRoutes(app: FastifyInstance) {
               return;
             }
             authorized = true;
+            console.log('[AgentWS] device auth OK', { deviceId, tenantSlug, status: device.status });
           } else {
-            console.warn('[AgentWS] device signature mismatch', { deviceId, tenantSlug });
+            console.warn('[AgentWS] device signature mismatch', {
+              deviceId,
+              tenantSlug,
+              secretLen: secret.length,
+              sigPrefix: deviceSignature.slice(0, 12),
+              expPrefix: expectedJson.slice(0, 12),
+            });
           }
         } else {
           console.warn('[AgentWS] device missing or no sync secret', {

@@ -1040,9 +1040,17 @@ export async function deviceRegisterHandler(req: FastifyRequest, reply: FastifyR
   const hasSyncSecretCol = cols('devices').includes('device_sync_secret');
 
   if (existing) {
-    const deviceSyncSecret = hasSyncSecretCol
-      ? (existing.device_sync_secret || d.deviceSyncSecret || crypto.randomBytes(32).toString('hex'))
-      : undefined;
+    // Pending: Electron iberen secret bilen syncla (tunnel HMAC gabat gelsin).
+    // Approved: bar bolan secret-i sakla (BI tassyklanandan soň üýtgemez).
+    let deviceSyncSecret: string | undefined;
+    if (hasSyncSecretCol) {
+      if (existing.status === 'pending' && d.deviceSyncSecret) {
+        deviceSyncSecret = d.deviceSyncSecret;
+      } else {
+        deviceSyncSecret =
+          existing.device_sync_secret || d.deviceSyncSecret || crypto.randomBytes(32).toString('hex');
+      }
+    }
     const setClauses = [
       'name = COALESCE(NULLIF(?, \'\'), name)',
       'hostname = ?',
@@ -1067,8 +1075,8 @@ export async function deviceRegisterHandler(req: FastifyRequest, reply: FastifyR
       d.ipAddress,
       d.appVersion,
     ];
-    if (hasSyncSecretCol) {
-      setClauses.push('device_sync_secret = COALESCE(NULLIF(device_sync_secret, \'\'), ?)');
+    if (hasSyncSecretCol && deviceSyncSecret) {
+      setClauses.push('device_sync_secret = ?');
       setParams.push(deviceSyncSecret);
     }
     db.prepare(`
