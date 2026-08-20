@@ -46,17 +46,63 @@ export async function agentRoutes(app: FastifyInstance) {
       }
 
       // Check device signature: HMAC-SHA256(deviceId) signed with device's sync secret
+      // Device must be approved + assigned to this tenantSlug (or primary tenant_slug)
       if (!authorized && deviceSignature && deviceId) {
         const db = getDb();
-        const device = db.prepare(`SELECT device_sync_secret FROM devices WHERE id = ?`).get(deviceId) as any;
+        const device = db
+          .prepare(`SELECT id, status, tenant_slug, device_sync_secret FROM devices WHERE id = ?`)
+          .get(deviceId) as any;
         if (device && device.device_sync_secret) {
           const expected = crypto
             .createHmac('sha256', device.device_sync_secret)
             .update(JSON.stringify({ deviceId }))
             .digest('hex');
           if (deviceSignature === expected) {
+            if (device.status !== 'approved') {
+              console.warn('[AgentWS] device not approved', { deviceId, status: device.status, tenantSlug });
+              try {
+                socket.send(
+                  JSON.stringify({
+                    error: 'Device not approved',
+                    status: device.status,
+                    hint: 'BI → Enjamlar → tassyklamak we firma baglamak',
+                  })
+                );
+                socket.close(1008, 'Device not approved');
+              } catch {
+                /* ignore */
+              }
+              return;
+            }
+            const assigned = db
+              .prepare(`SELECT 1 as ok FROM device_assignments WHERE device_id = ? AND tenant_slug = ? LIMIT 1`)
+              .get(deviceId, tenantSlug) as any;
+            const primaryOk = device.tenant_slug && String(device.tenant_slug) === tenantSlug;
+            if (!assigned && !primaryOk) {
+              console.warn('[AgentWS] device not assigned to tenant', { deviceId, tenantSlug });
+              try {
+                socket.send(
+                  JSON.stringify({
+                    error: 'Device not assigned to this company',
+                    tenantSlug,
+                    hint: 'BI-da enjamy şu firma bilen baglaň',
+                  })
+                );
+                socket.close(1008, 'Not assigned');
+              } catch {
+                /* ignore */
+              }
+              return;
+            }
             authorized = true;
+          } else {
+            console.warn('[AgentWS] device signature mismatch', { deviceId, tenantSlug });
           }
+        } else {
+          console.warn('[AgentWS] device missing or no sync secret', {
+            deviceId,
+            hasRow: Boolean(device),
+          });
         }
       }
 
@@ -69,9 +115,12 @@ export async function agentRoutes(app: FastifyInstance) {
           hasAdminSecretQuery: Boolean(adminSecret),
         });
         try {
-          socket.send(JSON.stringify({
-            error: 'Unauthorized agent: use device_sync_secret (X-Device-Id + deviceSignature). ADMIN_SYNC_SECRET is BI-only.',
-          }));
+          socket.send(
+            JSON.stringify({
+              error:
+                'Unauthorized agent: device must be approved + assigned; sign with device_sync_secret (deviceId + deviceSignature).',
+            })
+          );
           socket.close(1008, 'Unauthorized');
         } catch {
           /* ignore */
