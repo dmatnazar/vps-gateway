@@ -54,7 +54,7 @@ export async function adminRoutes(app: FastifyInstance) {
 
   // Device Management Routes
   app.post('/api/admin/devices/register', deviceRegisterHandler);
-  app.get('/api/admin/devices/status', deviceStatusHandler); // token or device-sig auth inside handler (register is public)
+  app.get('/api/admin/devices/status', deviceStatusHandler);
   app.get('/api/admin/devices', { preHandler: [app.verifyAdminSyncSignature] }, listDevicesHandler);
   app.post('/api/admin/devices/:id/approve', { preHandler: [app.verifyAdminSyncSignature] }, approveDeviceHandler);
   app.patch('/api/admin/devices/:id/status', { preHandler: [app.verifyAdminSyncSignature] }, updateDeviceStatusHandler);

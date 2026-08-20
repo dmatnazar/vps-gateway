@@ -1167,9 +1167,7 @@ export async function deviceStatusHandler(req: FastifyRequest, reply: FastifyRep
     return reply.code(404).send({ error: 'Device not found', status: 'not_found' });
   }
 
-  // Auth AFTER device exists in DB:
-  // 1) X-Device-Sync-Signature (approved devices)
-  // 2) OR query token match (pending poll from Electron — no ADMIN secret)
+  // Auth only after row exists (register is separate public endpoint)
   const deviceSyncSecretHeader = (req.headers['x-device-sync-signature'] as string | undefined) || '';
   const deviceIdHeader = (req.headers['x-device-id'] as string | undefined) || '';
   let authed = false;
@@ -1193,7 +1191,7 @@ export async function deviceStatusHandler(req: FastifyRequest, reply: FastifyRep
 
   if (!authed) {
     return reply.code(401).send({
-      error: 'Unauthorized — device token or valid X-Device-Sync-Signature required',
+      error: 'Unauthorized — provide device token query or valid X-Device-Sync-Signature',
       status: 'unauthorized',
     });
   }
