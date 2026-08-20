@@ -36,6 +36,7 @@ async function verifyAdminSignature(app: FastifyInstance, req: FastifyRequest, r
   }
 }
 
+/** Requires device row + device_sync_secret already in DB. Do NOT use on /devices/register or first /status. */
 async function verifyDeviceSignature(app: FastifyInstance, req: FastifyRequest, reply: FastifyReply) {
   const signature = req.headers['x-device-sync-signature'];
   const deviceId = req.headers['x-device-id'];
