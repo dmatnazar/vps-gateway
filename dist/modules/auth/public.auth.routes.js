@@ -5,6 +5,7 @@ const zod_1 = require("zod");
 const sqliteDb_1 = require("../../store/sqliteDb");
 const tenant_repository_1 = require("../tenant/tenant.repository");
 const passwordWorker_1 = require("../../core/workers/passwordWorker");
+const passwordEnc_1 = require("../../core/db/passwordEnc");
 const StaffVerifySchema = zod_1.z.object({
     username: zod_1.z.string().min(1),
     password: zod_1.z.string().min(1),
@@ -22,6 +23,17 @@ function parseTenantSlugs(raw) {
         }
     }
     return [];
+}
+function hashKind(hash) {
+    if (!hash)
+        return 'empty';
+    if (hash.startsWith('synced-from-bi') || hash.startsWith('pending-reset') || hash.endsWith(':0000'))
+        return 'placeholder';
+    if (hash.startsWith('$2a$') || hash.startsWith('$2b$') || hash.startsWith('$2y$'))
+        return 'bcrypt';
+    if (hash.includes(':'))
+        return 'scrypt';
+    return 'plain_or_unknown';
 }
 async function publicAuthRoutes(app) {
     app.post('/api/auth/verify', async (req, reply) => {
@@ -44,23 +56,38 @@ async function publicAuthRoutes(app) {
                     message: 'Bu hasap öçürilen (active=false). Administrator bilen habarlaşyň.',
                 });
             }
-            return reply.code(404).send({ error: 'not_found', message: 'User not found' });
+            return reply.code(404).send({ error: 'not_found', message: 'User not found in VPS staff DB' });
         }
         const hash = user.password_hash || '';
-        const isPlaceholder = !hash ||
-            hash.startsWith('synced-from-bi') ||
-            hash.startsWith('pending-reset') ||
-            hash.endsWith(':0000');
-        if (isPlaceholder) {
-            return reply.code(403).send({
-                error: 'password_not_available',
-                message: 'Password is managed externally. Use BI Platform to reset.',
-            });
+        const kind = hashKind(hash);
+        const isPlaceholder = kind === 'placeholder';
+        let ok = false;
+        if (!isPlaceholder) {
+            ok = (0, passwordWorker_1.verifyPasswordSync)(password, hash);
         }
-        // Electron scrypt (salt string + hex buffer) + bcrypt
-        const ok = (0, passwordWorker_1.verifyPasswordSync)(password, hash);
+        if (!ok && user.password_enc) {
+            try {
+                const plain = (0, passwordEnc_1.decryptPasswordPlain)(user.password_enc);
+                if (plain && plain === password)
+                    ok = true;
+            }
+            catch {
+                /* ignore */
+            }
+        }
         if (!ok) {
-            return reply.code(401).send({ error: 'invalid_password', message: 'Username or password is incorrect' });
+            if (isPlaceholder) {
+                return reply.code(403).send({
+                    error: 'password_not_available',
+                    message: 'VPS-de parol hash ýok (placeholder). BI-da işgäriň parolyny täzeden belläň we staff sync ediň.',
+                    hashKind: kind,
+                });
+            }
+            return reply.code(401).send({
+                error: 'invalid_password',
+                message: 'Username or password is incorrect',
+                hashKind: kind,
+            });
         }
         const tenant = user.tenant_slug
             ? await tenant_repository_1.tenantRepository.findBySlug(user.tenant_slug)
@@ -74,8 +101,8 @@ async function publicAuthRoutes(app) {
                 role: user.role,
                 tenantSlug: user.tenant_slug,
                 tenantSlugs: parseTenantSlugs(user.tenant_slugs),
-                tenantName: tenant?.name,
-                tenantId: tenant?.id,
+                tenantName: tenant === null || tenant === void 0 ? void 0 : tenant.name,
+                tenantId: tenant === null || tenant === void 0 ? void 0 : tenant.id,
                 phone: user.phone,
                 email: user.email,
                 active: Boolean(user.active),

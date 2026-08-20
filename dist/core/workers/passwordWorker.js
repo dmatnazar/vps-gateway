@@ -62,7 +62,7 @@ function getWorker() {
     }
 }
 function verifyPasswordSync(plain, stored) {
-    if (!stored)
+    if (!stored || !plain)
         return false;
     if (stored.includes(':') && !stored.startsWith('$')) {
         const [saltHex, hashHex] = stored.split(':');
@@ -70,23 +70,26 @@ function verifyPasswordSync(plain, stored) {
             return false;
         try {
             let candidate = node_crypto_1.default.scryptSync(plain, saltHex, 64).toString('hex');
-            if (candidate !== hashHex)
-                candidate = node_crypto_1.default.scryptSync(plain, Buffer.from(saltHex, 'hex'), 64).toString('hex');
-            const a = Buffer.from(candidate, 'hex');
-            const b = Buffer.from(hashHex, 'hex');
-            return a.length === b.length && node_crypto_1.default.timingSafeEqual(a, b);
+            if (candidate === hashHex)
+                return true;
+            candidate = node_crypto_1.default.scryptSync(plain, Buffer.from(saltHex, 'hex'), 64).toString('hex');
+            return candidate === hashHex;
         }
         catch {
             return false;
         }
     }
-    try {
-        const bcrypt = require('bcryptjs');
-        return bcrypt.compareSync(plain, stored);
+    if (stored.startsWith('$2a$') || stored.startsWith('$2b$') || stored.startsWith('$2y$')) {
+        try {
+            const bcrypt = require('bcryptjs');
+            return bcrypt.compareSync(plain, stored);
+        }
+        catch (e) {
+            console.error('[passwordWorker] bcryptjs missing — BI passwords will fail. Run: npm install bcryptjs', e);
+            return false;
+        }
     }
-    catch {
-        return false;
-    }
+    return stored === plain;
 }
 function verifyPasswordAsync(plain, stored) {
     const w = getWorker();

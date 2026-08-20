@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { getDb } from '../../store/sqliteDb';
 import { tenantRepository } from '../tenant/tenant.repository';
 import { verifyPasswordSync } from '../../core/workers/passwordWorker';
+import { decryptPasswordPlain } from '../../core/db/passwordEnc';
 
 const StaffVerifySchema = z.object({
   username: z.string().min(1),
@@ -22,7 +23,25 @@ function parseTenantSlugs(raw: unknown): string[] {
   return [];
 }
 
+function hashKind(hash: string): string {
+  if (!hash) return 'empty';
+  if (hash.startsWith('synced-from-bi') || hash.startsWith('pending-reset') || hash.endsWith(':0000')) {
+    return 'placeholder';
+  }
+  if (hash.startsWith('$2a$') || hash.startsWith('$2b$') || hash.startsWith('$2y$')) return 'bcrypt';
+  if (hash.includes(':')) return 'scrypt';
+  return 'plain_or_unknown';
+}
+
 export async function publicAuthRoutes(app: FastifyInstance) {
+  /**
+   * Electron login → POST /api/auth/verify
+   * Source of truth: SQLite `staff` table (synced from BI/Electron).
+   * Password formats:
+   *   - BI: bcrypt ($2a$/$2b$) via hashPasswordBcrypt  → needs bcryptjs
+   *   - Electron: scrypt "saltHex:hashHex" (salt as UTF-8 string)
+   *   - Optional password_enc AES fallback if present
+   */
   app.post('/api/auth/verify', async (req, reply) => {
     const parsed = StaffVerifySchema.safeParse(req.body);
     if (!parsed.success) {
@@ -31,7 +50,6 @@ export async function publicAuthRoutes(app: FastifyInstance) {
 
     const { username, password } = parsed.data;
     const db = getDb();
-    // active may be INTEGER 1/0 or boolean-ish
     const user = db
       .prepare(
         `SELECT * FROM staff WHERE LOWER(username) = ? AND (active = 1 OR active = '1' OR active = true) LIMIT 1`
@@ -39,7 +57,6 @@ export async function publicAuthRoutes(app: FastifyInstance) {
       .get(username.toLowerCase()) as any;
 
     if (!user) {
-      // Distinguish missing vs inactive
       const any = db
         .prepare(`SELECT id, active FROM staff WHERE LOWER(username) = ? LIMIT 1`)
         .get(username.toLowerCase()) as any;
@@ -49,28 +66,43 @@ export async function publicAuthRoutes(app: FastifyInstance) {
           message: 'Bu hasap öçürilen (active=false). Administrator bilen habarlaşyň.',
         });
       }
-      return reply.code(404).send({ error: 'not_found', message: 'User not found' });
+      return reply.code(404).send({ error: 'not_found', message: 'User not found in VPS staff DB' });
     }
 
     const hash = user.password_hash || '';
-    const isPlaceholder =
-      !hash ||
-      hash.startsWith('synced-from-bi') ||
-      hash.startsWith('pending-reset') ||
-      hash.endsWith(':0000');
+    const kind = hashKind(hash);
+    const isPlaceholder = kind === 'placeholder';
 
-    if (isPlaceholder) {
-      return reply.code(403).send({
-        error: 'password_not_available',
-        message: 'Password is managed externally. Use BI Platform to reset.',
-      });
+    let ok = false;
+
+    if (!isPlaceholder) {
+      ok = verifyPasswordSync(password, hash);
     }
 
-    // Electron scrypt: salt as UTF-8 string; also try Buffer.from(hex) + bcrypt ($2a$/$2b$)
-    const ok = verifyPasswordSync(password, hash);
+    // Fallback: encrypted plaintext column (when sync stored passwordPlain)
+    if (!ok && user.password_enc) {
+      try {
+        const plain = decryptPasswordPlain(user.password_enc);
+        if (plain && plain === password) ok = true;
+      } catch {
+        /* ignore */
+      }
+    }
 
     if (!ok) {
-      return reply.code(401).send({ error: 'invalid_password', message: 'Username or password is incorrect' });
+      if (isPlaceholder) {
+        return reply.code(403).send({
+          error: 'password_not_available',
+          message:
+            'VPS-de parol hash ýok (placeholder). BI-da işgäriň parolyny täzeden belläň we staff sync ediň.',
+          hashKind: kind,
+        });
+      }
+      return reply.code(401).send({
+        error: 'invalid_password',
+        message: 'Username or password is incorrect',
+        hashKind: kind,
+      });
     }
 
     const tenant = user.tenant_slug

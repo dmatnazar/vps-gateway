@@ -51,22 +51,40 @@ function getWorker(): Worker | null {
 }
 
 export function verifyPasswordSync(plain: string, stored: string): boolean {
-  if (!stored) return false;
+  if (!stored || !plain) return false;
+
+  // Electron scrypt: "saltHex:hashHex"
   if (stored.includes(':') && !stored.startsWith('$')) {
     const [saltHex, hashHex] = stored.split(':');
     if (!saltHex || !hashHex) return false;
     try {
+      // 1) salt as UTF-8 string (Electron staff:hashPassword)
       let candidate = crypto.scryptSync(plain, saltHex, 64).toString('hex');
-      if (candidate !== hashHex) candidate = crypto.scryptSync(plain, Buffer.from(saltHex, 'hex'), 64).toString('hex');
-      const a = Buffer.from(candidate, 'hex');
-      const b = Buffer.from(hashHex, 'hex');
-      return a.length === b.length && crypto.timingSafeEqual(a, b);
-    } catch { return false; }
+      if (candidate === hashHex) return true;
+      // 2) salt as binary from hex
+      candidate = crypto.scryptSync(plain, Buffer.from(saltHex, 'hex'), 64).toString('hex');
+      return candidate === hashHex;
+    } catch {
+      return false;
+    }
   }
-  try {
-    const bcrypt = require('bcryptjs');
-    return bcrypt.compareSync(plain, stored);
-  } catch { return false; }
+
+  // BI bcrypt ($2a$ / $2b$ / $2y$) — requires bcryptjs package
+  if (stored.startsWith('$2a$') || stored.startsWith('$2b$') || stored.startsWith('$2y$')) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const bcrypt = require('bcryptjs') as { compareSync: (p: string, h: string) => boolean };
+      return bcrypt.compareSync(plain, stored);
+    } catch (e) {
+      console.error(
+        '[passwordWorker] bcryptjs missing — BI passwords will fail. Run: npm install bcryptjs',
+        e
+      );
+      return false;
+    }
+  }
+
+  return stored === plain;
 }
 
 export function verifyPasswordAsync(plain: string, stored: string): Promise<boolean> {
