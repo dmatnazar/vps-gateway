@@ -1167,35 +1167,33 @@ export async function deviceStatusHandler(req: FastifyRequest, reply: FastifyRep
     return reply.code(404).send({ error: 'Device not found', status: 'not_found' });
   }
 
-  // Token check (register + status). ADMIN_SYNC_SECRET never used here.
-  if (query.token && row.token && query.token !== row.token) {
-    return reply.code(403).send({ error: 'Invalid device token', status: 'rejected' });
-  }
-
+  // Auth: device signature OR device token (Electron pending poll — no ADMIN_SYNC_SECRET)
   const deviceSyncSecretHeader = (req.headers['x-device-sync-signature'] as string | undefined) || '';
   const deviceIdHeader = (req.headers['x-device-id'] as string | undefined) || '';
-  const isPending = row.status === 'pending' || row.status === 'blocked';
+  let authed = false;
 
-  // Signature is optional for pending (new device waiting admin).
-  // For approved devices: if client sends signature, it must match device_sync_secret.
   if (deviceSyncSecretHeader && deviceIdHeader && row.device_sync_secret) {
     const payload = JSON.stringify({ deviceId: deviceIdHeader });
     const expected = crypto
       .createHmac('sha256', row.device_sync_secret)
       .update(payload)
       .digest('hex');
-
     const sigBuf = Buffer.from(deviceSyncSecretHeader);
     const expBuf = Buffer.from(expected);
-
-    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
-      // Pending: ignore mismatch (local secret may differ until re-register sync)
-      if (!isPending) {
-        return reply.code(403).send({ error: 'Invalid device sync signature', status: 'rejected' });
-      }
+    if (sigBuf.length === expBuf.length && crypto.timingSafeEqual(sigBuf, expBuf)) {
+      authed = true;
+    } else {
+      return reply.code(403).send({ error: 'Invalid device sync signature', status: 'rejected' });
     }
-  } else if (deviceSyncSecretHeader && !row.device_sync_secret && !isPending) {
-    return reply.code(403).send({ error: 'Device has no sync secret', status: 'rejected' });
+  } else if (query.token && row.token && query.token === row.token) {
+    authed = true;
+  }
+
+  if (!authed) {
+    return reply.code(401).send({
+      error: 'Unauthorized — provide device token or X-Device-Sync-Signature',
+      status: 'unauthorized',
+    });
   }
 
   db.prepare(`UPDATE devices SET last_seen_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`).run(query.deviceId);

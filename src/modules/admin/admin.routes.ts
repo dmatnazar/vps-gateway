@@ -54,10 +54,10 @@ export async function adminRoutes(app: FastifyInstance) {
 
   // Device Management Routes
   app.post('/api/admin/devices/register', deviceRegisterHandler);
-  app.get('/api/admin/devices/status', { preHandler: [app.verifySyncSignature] }, deviceStatusHandler);
+  app.get('/api/admin/devices/status', deviceStatusHandler);
   app.get('/api/admin/devices', { preHandler: [app.verifyAdminSyncSignature] }, listDevicesHandler);
   app.post('/api/admin/devices/:id/approve', { preHandler: [app.verifyAdminSyncSignature] }, approveDeviceHandler);
-  app.patch('/api/admin/devices/:id/status', { preHandler: [app.verifySyncSignature] }, updateDeviceStatusHandler);
+  app.patch('/api/admin/devices/:id/status', { preHandler: [app.verifyAdminSyncSignature] }, updateDeviceStatusHandler);
   app.delete('/api/admin/devices/:id', { preHandler: [app.verifyAdminSyncSignature] }, deleteDeviceHandler);
 
   app.get('/api/admin/routes', async (_req, reply) => {
