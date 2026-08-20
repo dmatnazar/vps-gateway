@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { getDb } from '../../store/sqliteDb';
+import { getDb, getAppSetting, setAppSetting } from '../../store/sqliteDb';
 import { tenantRepository } from '../tenant/tenant.repository';
 import { verifyPasswordSync } from '../../core/workers/passwordWorker';
 import { decryptPasswordPlain } from '../../core/db/passwordEnc';
@@ -125,5 +125,28 @@ export async function publicAuthRoutes(app: FastifyInstance) {
         active: Boolean(user.active),
       },
     });
+  });
+}
+
+/** Public read — Electron DeviceGate / all clients pull update server settings */
+export async function registerClientConfigRoutes(app: FastifyInstance) {
+  app.get('/api/client-config/update-feed', async (_req, reply) => {
+    const raw = getAppSetting('update_feed');
+    let cfg: Record<string, unknown> = {
+      protocol: 'https',
+      host: '',
+      port: '',
+      path: '/updates',
+      username: '',
+    };
+    if (raw) {
+      try {
+        cfg = { ...cfg, ...JSON.parse(raw) };
+      } catch {
+        /* ignore */
+      }
+    }
+    const { password: _p, ...safe } = cfg as any;
+    return reply.send({ ok: true, updateFeed: { ...safe, password: '' } });
   });
 }

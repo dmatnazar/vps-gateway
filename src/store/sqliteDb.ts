@@ -168,6 +168,7 @@ function applySchema(db: Database.Database) {
   migrateToV3(db);
   migrateToV4(db);
   migrateToV5(db);
+  migrateToV6(db);
 }
 
 /** v2: edit locks (is_open) on tenants / staff / endpoints */
@@ -296,6 +297,40 @@ function migrateToV5(db: Database.Database) {
   db.prepare(
     `INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (5, datetime('now'))`
   ).run();
+}
+
+/** v6: app_settings (Electron update feed, client defaults) */
+function migrateToV6(db: Database.Database) {
+  const ver = getSchemaVersion(db);
+  if (ver >= 6) return;
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL
+    );
+  `);
+
+  db.prepare(
+    `INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (6, datetime('now'))`
+  ).run();
+}
+
+export function getAppSetting(key: string): string {
+  const db = getDb();
+  const row = db.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key) as
+    | { value: string }
+    | undefined;
+  return row?.value ?? '';
+}
+
+export function setAppSetting(key: string, value: string): void {
+  const db = getDb();
+  db.prepare(
+    `INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  ).run(key, value);
 }
 
 function getSchemaVersion(db: Database.Database): number {

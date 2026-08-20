@@ -5,7 +5,7 @@ import { authPlugin } from './plugins/auth.plugin';
 import { adminRoutes } from './modules/admin/admin.routes';
 import { healthRoutes } from './modules/health/health.routes';
 import { agentRoutes } from './modules/agent/agent.routes';
-import { publicAuthRoutes } from './modules/auth/public.auth.routes';
+import { publicAuthRoutes, registerClientConfigRoutes } from './modules/auth/public.auth.routes';
 import { registerDynamicRouter } from './core/router/dynamicRouter';
 import { registerAvatarRoutes } from './modules/avatar/avatar.routes';
 import { routeRegistry } from './core/router/routeRegistry';
@@ -76,6 +76,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(authPlugin);
   await app.register(healthRoutes);
   await publicAuthRoutes(app);
+  await registerClientConfigRoutes(app);
   await app.register(adminRoutes);
   await app.register(agentRoutes);
   await registerAvatarRoutes(app);

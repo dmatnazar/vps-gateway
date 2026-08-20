@@ -63,4 +63,61 @@ export async function adminRoutes(app: FastifyInstance) {
   app.get('/api/admin/routes', async (_req, reply) => {
     return reply.send(routeRegistry.debugAll());
   });
+
+  // Electron auto-update feed — BI writes, Electrons read public GET /api/client-config/update-feed
+  app.get(
+    '/api/admin/client-config/update-feed',
+    { preHandler: [app.verifyAdminSyncSignature] },
+    async (_req, reply) => {
+      const { getAppSetting } = await import('../../store/sqliteDb');
+      const raw = getAppSetting('update_feed');
+      let cfg: any = {
+        protocol: 'https',
+        host: '',
+        port: '',
+        path: '/updates',
+        username: '',
+        password: '',
+      };
+      if (raw) {
+        try {
+          cfg = { ...cfg, ...JSON.parse(raw) };
+        } catch {
+          /* */
+        }
+      }
+      return reply.send({ ok: true, updateFeed: cfg });
+    }
+  );
+
+  app.put(
+    '/api/admin/client-config/update-feed',
+    { preHandler: [app.verifyAdminSyncSignature] },
+    async (req, reply) => {
+      const { getAppSetting, setAppSetting } = await import('../../store/sqliteDb');
+      const body = (req.body || {}) as Record<string, unknown>;
+      let prev: any = {};
+      try {
+        prev = JSON.parse(getAppSetting('update_feed') || '{}');
+      } catch {
+        prev = {};
+      }
+      const next = {
+        protocol: body.protocol === 'http' ? 'http' : 'https',
+        host: String(body.host || prev.host || '').trim(),
+        port: body.port !== undefined && body.port !== '' ? String(body.port) : prev.port || '',
+        path: String(body.path || prev.path || '/updates'),
+        username: String(body.username ?? prev.username ?? ''),
+        password:
+          body.password !== undefined && String(body.password).length > 0
+            ? String(body.password)
+            : prev.password || '',
+      };
+      setAppSetting('update_feed', JSON.stringify(next));
+      return reply.send({
+        ok: true,
+        updateFeed: { ...next, password: next.password ? '••••' : '' },
+      });
+    }
+  );
 }
