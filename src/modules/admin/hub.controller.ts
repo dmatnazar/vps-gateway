@@ -4,12 +4,24 @@ import crypto from 'node:crypto';
 import { getDb, logSync } from '../../store/sqliteDb';
 import { tenantRepository } from '../tenant/tenant.repository';
 import { encryptPasswordPlain } from '../../core/db/passwordEnc';
+import { deviceEventManager } from '../../core/tunnel/deviceEventManager';
 import type {
   StaffRecord,
   RegistrationRecord,
   StaffRole,
   UserNotification,
 } from '../../types/contracts';
+
+const randomId = () => {
+  if (typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+};
 
 // ── Catalog ──────────────────────────────────────────────────
 
@@ -127,7 +139,7 @@ export async function createTenantHandler(req: FastifyRequest, reply: FastifyRep
   }
 
   const now = new Date().toISOString();
-  const id = crypto.randomUUID();
+  const id = randomId();
 
   db.prepare(`
     INSERT INTO tenants (id, slug, name, is_active, created_at, updated_at)
@@ -435,7 +447,7 @@ export async function createRegistrationHandler(req: FastifyRequest, reply: Fast
   if (!phone.startsWith('+993')) phone = '+993' + phone.replace(/^\+?/, '');
 
   const now = new Date().toISOString();
-  const id = crypto.randomUUID();
+  const id = randomId();
 
   db.prepare(`
     INSERT INTO registrations (id, tenant_slug, tenant_name, first_name, last_name, phone, email, username, password_hash, status, requested_role, created_at)
@@ -601,7 +613,7 @@ export async function resolveRegistrationHandler(req: FastifyRequest, reply: Fas
   if (action === 'approve') {
     const staffRole = role || reg.requested_role || 'viewer';
     const existingStaff = db.prepare(`SELECT * FROM staff WHERE LOWER(username) = ?`).get(reg.username.toLowerCase()) as any;
-    const staffId = existingStaff ? existingStaff.id : crypto.randomUUID();
+    const staffId = existingStaff ? existingStaff.id : randomId();
     const finalFn = firstName || reg.first_name;
     const finalLn = lastName || reg.last_name;
 
@@ -636,7 +648,7 @@ export async function resolveRegistrationHandler(req: FastifyRequest, reply: Fas
   }
 
   // Create notification for user
-  const notifId = crypto.randomUUID();
+  const notifId = randomId();
   db.prepare(`
     INSERT INTO notifications (id, username, type, title, message, read, created_at)
     VALUES (?, ?, ?, ?, ?, 0, ?)
@@ -737,7 +749,7 @@ export async function tenantUpdateHandler(req: FastifyRequest, reply: FastifyRep
       return reply.code(404).send({ error: 'Tenant not found' });
     }
     // New companies are always active by default
-    const id = crypto.randomUUID();
+    const id = randomId();
     const active = parsed.data.isActive !== false ? 1 : 0;
     db.prepare(`
       INSERT INTO tenants (id, slug, name, is_active, created_at, updated_at)
@@ -783,7 +795,7 @@ export async function tenantUpdateHandler(req: FastifyRequest, reply: FastifyRep
     // Do not hard-delete endpoints — only soft-deactivate the company
     db.prepare(`UPDATE staff SET active = 0 WHERE tenant_slug = ?`).run(t.slug);
 
-    const notifId = crypto.randomUUID();
+    const notifId = randomId();
     const title = 'Kompaniýa öçürildi (passiw)';
     const message =
       epCount > 0
@@ -807,7 +819,7 @@ export async function tenantUpdateHandler(req: FastifyRequest, reply: FastifyRep
         db.prepare(`
           INSERT INTO notifications (id, username, type, title, message, read, created_at)
           VALUES (?, ?, ?, ?, ?, 0, ?)
-        `).run(crypto.randomUUID(), a.username, 'tenant_deactivated', title, message, now);
+        `).run(randomId(), a.username, 'tenant_deactivated', title, message, now);
       }
     }
 
@@ -1026,6 +1038,7 @@ const DeviceRegisterSchema = z.object({
   macAddress: z.string().optional().default(''),
   ipAddress: z.string().optional().default(''),
   appVersion: z.string().optional().default('1.0.0'),
+  deviceSyncSecret: z.string().optional().default(''),
 });
 
 export async function deviceRegisterHandler(req: FastifyRequest, reply: FastifyReply) {
@@ -1036,22 +1049,28 @@ export async function deviceRegisterHandler(req: FastifyRequest, reply: FastifyR
   const db = getDb();
   const existing = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(d.id) as any;
 
+  const cols = (table: string) =>
+    (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((r) => r.name);
+  const hasSyncSecretCol = cols('devices').includes('device_sync_secret');
+
   if (existing) {
-    db.prepare(`
-      UPDATE devices
-      SET name = COALESCE(NULLIF(?, ''), name),
-          hostname = ?,
-          os_platform = ?,
-          os_release = ?,
-          ram_gb = ?,
-          cpu_model = ?,
-          mac_address = ?,
-          ip_address = ?,
-          app_version = ?,
-          last_seen_at = datetime('now'),
-          updated_at = datetime('now')
-      WHERE id = ?
-    `).run(
+    const deviceSyncSecret = hasSyncSecretCol
+      ? (existing.device_sync_secret || d.deviceSyncSecret || crypto.randomBytes(32).toString('hex'))
+      : undefined;
+    const setClauses = [
+      'name = COALESCE(NULLIF(?, \'\'), name)',
+      'hostname = ?',
+      'os_platform = ?',
+      'os_release = ?',
+      'ram_gb = ?',
+      'cpu_model = ?',
+      'mac_address = ?',
+      'ip_address = ?',
+      'app_version = ?',
+      'last_seen_at = datetime(\'now\')',
+      'updated_at = datetime(\'now\')',
+    ];
+    const setParams: any[] = [
       d.name || existing.name,
       d.hostname,
       d.osPlatform,
@@ -1061,28 +1080,60 @@ export async function deviceRegisterHandler(req: FastifyRequest, reply: FastifyR
       d.macAddress,
       d.ipAddress,
       d.appVersion,
-      d.id
-    );
-  } else {
+    ];
+    if (hasSyncSecretCol) {
+      setClauses.push('device_sync_secret = COALESCE(NULLIF(device_sync_secret, \'\'), ?)');
+      setParams.push(deviceSyncSecret);
+    }
     db.prepare(`
-      INSERT INTO devices (
-        id, token, name, hostname, os_platform, os_release,
-        ram_gb, cpu_model, mac_address, ip_address, tenant_id,
-        tenant_slug, status, app_version, last_seen_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', 'pending', ?, datetime('now'), datetime('now'), datetime('now'))
-    `).run(
-      d.id,
-      d.token,
-      d.name || d.hostname || 'Client Server',
-      d.hostname,
-      d.osPlatform,
-      d.osRelease,
-      d.ramGb,
-      d.cpuModel,
-      d.macAddress,
-      d.ipAddress,
-      d.appVersion
-    );
+      UPDATE devices
+      SET ${setClauses.join(',\n          ')}
+      WHERE id = ?
+    `).run(...setParams, d.id);
+  } else {
+    const deviceSyncSecret = d.deviceSyncSecret || crypto.randomBytes(32).toString('hex');
+    if (hasSyncSecretCol) {
+      db.prepare(`
+        INSERT INTO devices (
+          id, token, name, hostname, os_platform, os_release,
+          ram_gb, cpu_model, mac_address, ip_address, tenant_id,
+          tenant_slug, status, app_version, device_sync_secret, last_seen_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', 'pending', ?, ?, datetime('now'), datetime('now'), datetime('now'))
+      `).run(
+        d.id,
+        d.token,
+        d.name || d.hostname || 'Client Server',
+        d.hostname,
+        d.osPlatform,
+        d.osRelease,
+        d.ramGb,
+        d.cpuModel,
+        d.macAddress,
+        d.ipAddress,
+        d.appVersion,
+        deviceSyncSecret
+      );
+    } else {
+      db.prepare(`
+        INSERT INTO devices (
+          id, token, name, hostname, os_platform, os_release,
+          ram_gb, cpu_model, mac_address, ip_address, tenant_id,
+          tenant_slug, status, app_version, last_seen_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', 'pending', ?, datetime('now'), datetime('now'), datetime('now'))
+      `).run(
+        d.id,
+        d.token,
+        d.name || d.hostname || 'Client Server',
+        d.hostname,
+        d.osPlatform,
+        d.osRelease,
+        d.ramGb,
+        d.cpuModel,
+        d.macAddress,
+        d.ipAddress,
+        d.appVersion
+      );
+    }
     logSync('create', 'device', d.id, 'electron', { hostname: d.hostname, name: d.name });
   }
 
@@ -1102,6 +1153,7 @@ export async function deviceRegisterHandler(req: FastifyRequest, reply: FastifyR
     tenantSlug: updated.tenant_slug,
     companyName,
     name: updated.name,
+    deviceSyncSecret: updated.device_sync_secret || undefined,
   });
 }
 
@@ -1113,6 +1165,26 @@ export async function deviceStatusHandler(req: FastifyRequest, reply: FastifyRep
   const row = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(query.deviceId) as any;
   if (!row) {
     return reply.code(404).send({ error: 'Device not found', status: 'not_found' });
+  }
+
+  const deviceSyncSecretHeader = (req.headers['x-device-sync-signature'] as string | undefined) || '';
+  const deviceIdHeader = (req.headers['x-device-id'] as string | undefined) || '';
+
+  if (deviceSyncSecretHeader && deviceIdHeader && row.device_sync_secret) {
+    const payload = JSON.stringify({ deviceId: deviceIdHeader });
+    const expected = crypto
+      .createHmac('sha256', row.device_sync_secret)
+      .update(payload)
+      .digest('hex');
+
+    const sigBuf = Buffer.from(deviceSyncSecretHeader);
+    const expBuf = Buffer.from(expected);
+
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      return reply.code(403).send({ error: 'Invalid device sync signature', status: 'rejected' });
+    }
+  } else if (deviceSyncSecretHeader && !row.device_sync_secret) {
+    return reply.code(403).send({ error: 'Device has no sync secret', status: 'rejected' });
   }
 
   db.prepare(`UPDATE devices SET last_seen_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`).run(query.deviceId);
@@ -1142,6 +1214,7 @@ export async function deviceStatusHandler(req: FastifyRequest, reply: FastifyRep
     companyName,
     companySlugs,
     companyNames,
+    deviceSyncSecret: row.device_sync_secret || undefined,
     name: row.name,
     hostname: row.hostname,
   });
@@ -1183,6 +1256,7 @@ export async function listDevicesHandler(_req: FastifyRequest, reply: FastifyRep
       companyNames,
       status: r.status,
       appVersion: r.app_version,
+      deviceSyncSecret: r.device_sync_secret || undefined,
       lastSeenAt: r.last_seen_at,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
@@ -1224,15 +1298,32 @@ export async function approveDeviceHandler(req: FastifyRequest, reply: FastifyRe
 
   db.prepare(`DELETE FROM device_assignments WHERE device_id = ?`).run(params.id);
 
+  const cols = (table: string) =>
+    (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((r) => r.name);
+  const hasSyncSecretCol = cols('devices').includes('device_sync_secret');
+  const deviceSyncSecret = hasSyncSecretCol
+    ? (device.device_sync_secret || crypto.randomBytes(32).toString('hex'))
+    : undefined;
+
+  const setClauses = [
+    'tenant_id = ?',
+    'tenant_slug = ?',
+    'status = \'approved\'',
+    'name = COALESCE(NULLIF(?, \'\'), name)',
+    'updated_at = datetime(\'now\')',
+  ];
+  const setParams: any[] = [primaryTenant.id, primaryTenant.slug, body.name || ''];
+
+  if (hasSyncSecretCol) {
+    setClauses.push('device_sync_secret = ?');
+    setParams.push(deviceSyncSecret);
+  }
+
   db.prepare(`
     UPDATE devices
-    SET tenant_id = ?,
-        tenant_slug = ?,
-        status = 'approved',
-        name = COALESCE(NULLIF(?, ''), name),
-        updated_at = datetime('now')
+    SET ${setClauses.join(',\n        ')}
     WHERE id = ?
-  `).run(primaryTenant.id, primaryTenant.slug, body.name || '', params.id);
+  `).run(...setParams, params.id);
 
   const now = new Date().toISOString();
   const insertAssignment = db.prepare(`
@@ -1241,13 +1332,23 @@ export async function approveDeviceHandler(req: FastifyRequest, reply: FastifyRe
   `);
 
   for (const tenant of tenants) {
-    const assignmentId = crypto.randomUUID();
+    const assignmentId = randomId();
     insertAssignment.run(assignmentId, params.id, tenant.slug, now, now);
   }
 
   logSync('approve', 'device', params.id, 'bi_admin', { tenantSlugs: tenants.map((t) => t.slug) });
 
   const updated = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(params.id) as any;
+
+  // ⚡ Real-time push to the Electron device — it will automatically detect it was approved
+  deviceEventManager.broadcast(params.id, {
+    type: 'DEVICE_APPROVED',
+    deviceId: params.id,
+    status: 'approved',
+    companySlugs: tenants.map((t) => t.slug),
+    companyNames: tenants.map((t) => t.name),
+  });
+
   return reply.send({
     ok: true,
     device: {
@@ -1259,6 +1360,7 @@ export async function approveDeviceHandler(req: FastifyRequest, reply: FastifyRe
       companyNames: tenants.map((t) => t.name),
       companySlugs: tenants.map((t) => t.slug),
       status: updated.status,
+      deviceSyncSecret: updated.device_sync_secret,
     },
   });
 }
@@ -1311,7 +1413,7 @@ export async function updateDeviceStatusHandler(req: FastifyRequest, reply: Fast
         VALUES (?, ?, ?, NULL, '', ?, ?)
       `);
       for (const slug of newSlugs) {
-        insertAssignment.run(crypto.randomUUID(), params.id, slug, now, now);
+        insertAssignment.run(randomId(), params.id, slug, now, now);
       }
     }
   }
@@ -1328,6 +1430,28 @@ export async function updateDeviceStatusHandler(req: FastifyRequest, reply: Fast
 
   logSync('update', 'device', params.id, 'bi_admin', { status: body.status, tenantSlugs });
 
+  // ⚡ Real-time push — Electron immediately switches to blocked/pending state
+  if (body.status === 'blocked') {
+    deviceEventManager.broadcast(params.id, {
+      type: 'DEVICE_BLOCKED',
+      deviceId: params.id,
+      status: 'blocked',
+    });
+  } else if (body.status === 'approved') {
+    deviceEventManager.broadcast(params.id, {
+      type: 'DEVICE_APPROVED',
+      deviceId: params.id,
+      status: 'approved',
+      companySlugs: tenantSlugs,
+    });
+  } else if (body.status === 'pending') {
+    deviceEventManager.broadcast(params.id, {
+      type: 'DEVICE_UPDATED',
+      deviceId: params.id,
+      status: 'pending',
+    });
+  }
+
   return reply.send({ ok: true, status: body.status, tenantSlugs });
 }
 
@@ -1336,6 +1460,13 @@ export async function deleteDeviceHandler(req: FastifyRequest, reply: FastifyRep
   const db = getDb();
   const device = db.prepare(`SELECT * FROM devices WHERE id = ?`).get(params.id) as any;
   if (!device) return reply.code(404).send({ error: 'Device not found' });
+
+  // ⚡ Real-time push to the Electron device — it sees the device was deleted
+  deviceEventManager.broadcast(params.id, {
+    type: 'DEVICE_DELETED',
+    deviceId: params.id,
+    status: 'deleted',
+  });
 
   db.prepare(`DELETE FROM devices WHERE id = ?`).run(params.id);
   logSync('delete', 'device', params.id, 'bi_admin', { hostname: device.hostname });

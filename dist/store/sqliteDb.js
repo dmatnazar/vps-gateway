@@ -168,6 +168,7 @@ function applySchema(db) {
     migrateToV2(db);
     migrateToV3(db);
     migrateToV4(db);
+    migrateToV5(db);
 }
 /** v2: edit locks (is_open) on tenants / staff / endpoints */
 function migrateToV2(db) {
@@ -210,6 +211,7 @@ function migrateToV3(db) {
       tenant_slug TEXT DEFAULT '',
       status TEXT NOT NULL DEFAULT 'pending',
       app_version TEXT DEFAULT '1.0.0',
+      device_sync_secret TEXT DEFAULT '',
       last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -254,6 +256,17 @@ function migrateToV4(db) {
     CREATE INDEX IF NOT EXISTS idx_device_assignments_tenant ON device_assignments(tenant_slug);
   `);
     db.prepare(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (4, datetime('now'))`).run();
+}
+/** v5: device-specific sync secret */
+function migrateToV5(db) {
+    const ver = getSchemaVersion(db);
+    if (ver >= 5)
+        return;
+    const cols = (table) => db.prepare(`PRAGMA table_info(${table})`).all().map((r) => r.name);
+    if (!cols('devices').includes('device_sync_secret')) {
+        db.exec(`ALTER TABLE devices ADD COLUMN device_sync_secret TEXT DEFAULT ''`);
+    }
+    db.prepare(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (5, datetime('now'))`).run();
 }
 function getSchemaVersion(db) {
     try {

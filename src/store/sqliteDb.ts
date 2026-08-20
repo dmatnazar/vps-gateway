@@ -41,9 +41,6 @@ export function getDb(): Database.Database {
 // ---------------------------------------------------------------------------
 
 function applySchema(db: Database.Database) {
-  const currentVersion = getSchemaVersion(db);
-  if (currentVersion >= CURRENT_SCHEMA_VERSION) return;
-
   db.exec(`
     CREATE TABLE IF NOT EXISTS tenants (
       id TEXT PRIMARY KEY,
@@ -170,6 +167,7 @@ function applySchema(db: Database.Database) {
   migrateToV2(db);
   migrateToV3(db);
   migrateToV4(db);
+  migrateToV5(db);
 }
 
 /** v2: edit locks (is_open) on tenants / staff / endpoints */
@@ -202,6 +200,13 @@ function migrateToV2(db: Database.Database) {
 function migrateToV3(db: Database.Database) {
   const ver = getSchemaVersion(db);
   if (ver >= 3) return;
+
+  const cols = (table: string) =>
+    (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((r) => r.name);
+
+  if (!cols('devices').includes('device_sync_secret')) {
+    db.exec(`ALTER TABLE devices ADD COLUMN device_sync_secret TEXT DEFAULT ''`);
+  }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS devices (
@@ -273,6 +278,23 @@ function migrateToV4(db: Database.Database) {
 
   db.prepare(
     `INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (4, datetime('now'))`
+  ).run();
+}
+
+/** v5: device-specific sync secret */
+function migrateToV5(db: Database.Database) {
+  const ver = getSchemaVersion(db);
+  if (ver >= 5) return;
+
+  const cols = (table: string) =>
+    (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((r) => r.name);
+
+  if (!cols('devices').includes('device_sync_secret')) {
+    db.exec(`ALTER TABLE devices ADD COLUMN device_sync_secret TEXT DEFAULT ''`);
+  }
+
+  db.prepare(
+    `INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (5, datetime('now'))`
   ).run();
 }
 

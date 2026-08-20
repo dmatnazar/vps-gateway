@@ -114,9 +114,10 @@ async function handleDynamic(
       return reply.code(503).send({
         error: 'Ýerli Electron Agent birikdirilmedik',
         detail: `MSSQL maglumat bazasy ýerli torda (${parsed.server}:${parsed.port || 1433}) ýerleşýär. VPS Gateway ýerli tora gönüden-göni baglanyp bilmeýär.`,
-        hint: `Bu kompaniýanyň ýerli kompýuterindäki Electron programmasyny işlediň (VPS Tunnel arkaly maglumat berer).`,
+        hint: `1) «${tenantSlug}» firma kompýuterinde Electron işläp durmaly. 2) Electron Settings-de Gateway URL = VPS public adres (localhost däl). 3) Device BI-da approved + bu firma baglanan. 4) Electron-da tunnel status ONLINE bolmaly.`,
         tenantSlug,
         agentOnline: false,
+        dbHost: parsed.server,
       });
     }
   } catch {
