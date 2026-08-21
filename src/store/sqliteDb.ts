@@ -169,6 +169,8 @@ function applySchema(db: Database.Database) {
   migrateToV4(db);
   migrateToV5(db);
   migrateToV6(db);
+  migrateToV7(db);
+  migrateToV8(db);
 }
 
 /** v2: edit locks (is_open) on tenants / staff / endpoints */
@@ -314,6 +316,55 @@ function migrateToV6(db: Database.Database) {
 
   db.prepare(
     `INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (6, datetime('now'))`
+  ).run();
+}
+
+/** v7: device_settings (per-device / per-tenant settings: autostart, etc.) */
+function migrateToV7(db: Database.Database) {
+  const ver = getSchemaVersion(db);
+  if (ver >= 7) return;
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS device_settings (
+      id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      tenant_slug TEXT NOT NULL DEFAULT '',
+      settings_json TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_by TEXT DEFAULT '',
+      UNIQUE(device_id, tenant_slug)
+    );
+    CREATE INDEX IF NOT EXISTS idx_device_settings_device ON device_settings(device_id);
+    CREATE INDEX IF NOT EXISTS idx_device_settings_tenant ON device_settings(tenant_slug);
+  `);
+
+  db.prepare(
+    `INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (7, datetime('now'))`
+  ).run();
+}
+
+/** v8: structured DB connection meta (host/port/user…) for BI admin UI */
+function migrateToV8(db: Database.Database) {
+  const ver = getSchemaVersion(db);
+  if (ver >= 8) return;
+
+  const cols = (db.prepare(`PRAGMA table_info(tenant_connections)`).all() as { name: string }[]).map(
+    (r) => r.name
+  );
+  const add = (name: string, ddl: string) => {
+    if (!cols.includes(name)) db.exec(`ALTER TABLE tenant_connections ADD COLUMN ${ddl}`);
+  };
+  add('host', 'host TEXT DEFAULT \'\'');
+  add('port', 'port INTEGER DEFAULT 1433');
+  add('username', 'username TEXT DEFAULT \'\'');
+  add('encrypt', 'encrypt INTEGER DEFAULT 1');
+  add('trust_server_certificate', 'trust_server_certificate INTEGER DEFAULT 1');
+  add('is_primary', 'is_primary INTEGER DEFAULT 0');
+  add('guid', 'guid TEXT DEFAULT \'\'');
+  add('updated_at', 'updated_at TEXT');
+
+  db.prepare(
+    `INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (8, datetime('now'))`
   ).run();
 }
 

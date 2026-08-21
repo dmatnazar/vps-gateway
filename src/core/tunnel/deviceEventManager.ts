@@ -1,12 +1,21 @@
 import type { WebSocket } from 'ws';
 
 export interface DeviceEventPayload {
-  type: 'DEVICE_APPROVED' | 'DEVICE_BLOCKED' | 'DEVICE_DELETED' | 'COMPANY_ASSIGNED' | 'COMPANY_REMOVED' | 'DEVICE_UPDATED';
+  type:
+    | 'DEVICE_APPROVED'
+    | 'DEVICE_BLOCKED'
+    | 'DEVICE_DELETED'
+    | 'COMPANY_ASSIGNED'
+    | 'COMPANY_REMOVED'
+    | 'DEVICE_UPDATED'
+    | 'SETTINGS_UPDATED';
   deviceId: string;
   status?: string;
   companySlugs?: string[];
   companyNames?: string[];
   tenantSlug?: string;
+  /** Per-device settings payload (autostart, autoSync, …) */
+  settings?: Record<string, unknown>;
   timestamp: string;
 }
 

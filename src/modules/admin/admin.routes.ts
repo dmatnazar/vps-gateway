@@ -24,6 +24,12 @@ import {
   updateDeviceStatusHandler,
   deleteDeviceHandler,
   createTenantHandler,
+  deviceSettingsGetHandler,
+  deviceSettingsUpsertHandler,
+  testQueryHandler,
+  connectionUpsertHandler,
+  connectionDeleteHandler,
+  staffPasswordResetHandler,
 } from './hub.controller';
 
 import { routeRegistry } from '../../core/router/routeRegistry';
@@ -51,6 +57,27 @@ export async function adminRoutes(app: FastifyInstance) {
   app.post('/api/admin/tenant-delete', { preHandler: [app.verifySyncSignature] }, tenantDeleteHandler);
   app.post('/api/admin/staff-delete', { preHandler: [app.verifySyncSignature] }, staffDeleteHandler);
   app.post('/api/admin/entity-lock', { preHandler: [app.verifySyncSignature] }, entityLockHandler);
+
+  // Device settings (Firma Sazlamalary) — BI (admin) & Electron (device signature)
+  app.get('/api/admin/device-settings', { preHandler: [app.verifyAdminSyncSignature] }, deviceSettingsGetHandler);
+  app.put('/api/admin/device-settings', { preHandler: [app.verifyAdminSyncSignature] }, deviceSettingsUpsertHandler);
+  app.post('/api/admin/device-settings', { preHandler: [app.verifyAdminSyncSignature] }, deviceSettingsUpsertHandler);
+  // Electron device can also push/pull own settings
+  app.get('/api/admin/device-settings/self', { preHandler: [app.verifySyncSignature] }, deviceSettingsGetHandler);
+  app.put('/api/admin/device-settings/self', { preHandler: [app.verifySyncSignature] }, deviceSettingsUpsertHandler);
+  app.post('/api/admin/device-settings/self', { preHandler: [app.verifySyncSignature] }, deviceSettingsUpsertHandler);
+
+  // Admin ad-hoc SQL test (Electron agent tunnel)
+  app.post('/api/admin/test-query', { preHandler: [app.verifyAdminSyncSignature] }, testQueryHandler);
+
+  // DB connections CRUD (BI)
+  app.post('/api/admin/connection-upsert', { preHandler: [app.verifyAdminSyncSignature] }, connectionUpsertHandler);
+  app.post('/api/admin/connection-delete', { preHandler: [app.verifyAdminSyncSignature] }, connectionDeleteHandler);
+  // Electron device signature variants
+  app.post('/api/admin/connection-upsert/self', { preHandler: [app.verifySyncSignature] }, connectionUpsertHandler);
+  app.post('/api/admin/connection-delete/self', { preHandler: [app.verifySyncSignature] }, connectionDeleteHandler);
+  app.post('/api/admin/staff-password-reset', { preHandler: [app.verifyAdminSyncSignature] }, staffPasswordResetHandler);
+
 
   // Device Management Routes
   app.post('/api/admin/devices/register', deviceRegisterHandler);

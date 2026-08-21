@@ -31,29 +31,69 @@ export async function catalogHandler(_req: FastifyRequest, reply: FastifyReply) 
   // Return all tenants (active + passive) so admin UIs can show / reactivate them
   const tenantRows = db.prepare(`SELECT * FROM tenants`).all() as any[];
   const connStmt = db.prepare(
-    `SELECT db_key as dbKey, label, database_name as database FROM tenant_connections WHERE tenant_id = ?`
+    `SELECT * FROM tenant_connections WHERE tenant_id = ?`
+  );
+  const staffCountStmt = db.prepare(
+    `SELECT COUNT(*) as c FROM staff WHERE tenant_slug = ? AND active = 1`
+  );
+  const epCountStmt = db.prepare(
+    `SELECT COUNT(*) as c FROM endpoints WHERE tenant_slug = ?`
+  );
+  const deviceCountStmt = db.prepare(
+    `SELECT COUNT(*) as c FROM devices WHERE tenant_slug = ? OR id IN (SELECT device_id FROM device_assignments WHERE tenant_slug = ?)`
   );
 
-  const tenants = tenantRows.map((t) => ({
-    id: t.id,
-    slug: t.slug,
-    name: t.name,
-    isActive: Boolean(t.is_active),
-    connections: connStmt.all(t.id),
-    updatedAt: t.updated_at,
-  }));
+  const tenants = tenantRows.map((t) => {
+    const rawConns = connStmt.all(t.id) as any[];
+    const connections = rawConns.map((c) => ({
+      id: String(c.id),
+      guid: c.guid || String(c.id),
+      dbKey: c.db_key,
+      label: c.label || c.db_key,
+      database: c.database_name || '',
+      host: c.host || '',
+      port: c.port ?? 1433,
+      username: c.username || '',
+      encrypt: c.encrypt === undefined ? true : Boolean(c.encrypt),
+      trustServerCertificate:
+        c.trust_server_certificate === undefined ? true : Boolean(c.trust_server_certificate),
+      isPrimary: Boolean(c.is_primary),
+      hasPassword: Boolean(c.db_conn_enc),
+      updatedAt: c.updated_at || null,
+    }));
+    return {
+      id: t.id,
+      slug: t.slug,
+      name: t.name,
+      isActive: Boolean(t.is_active),
+      connections,
+      connectionCount: connections.length,
+      staffCount: (staffCountStmt.get(t.slug) as { c: number })?.c ?? 0,
+      endpointCount: (epCountStmt.get(t.slug) as { c: number })?.c ?? 0,
+      deviceCount: (deviceCountStmt.get(t.slug, t.slug) as { c: number })?.c ?? 0,
+      updatedAt: t.updated_at,
+      createdAt: t.created_at,
+    };
+  });
 
   const endpointRows = db.prepare(`SELECT * FROM endpoints`).all() as any[];
   const endpoints = endpointRows.map((e) => ({
     id: e.id,
+    tenantId: e.tenant_id,
     tenantSlug: e.tenant_slug,
     name: e.name,
     method: e.method,
     pathTemplate: e.path_template,
+    sqlQuery: e.sql_query || '',
     paramsSchema: JSON.parse(e.params_schema || '{}'),
+    responseSchema: e.response_schema ? JSON.parse(e.response_schema) : null,
     cacheTtlSec: e.cache_ttl_sec,
     authRequired: Boolean(e.auth_required),
     dbKey: e.db_key,
+    connectionId: e.connection_id || '',
+    databaseName: e.database_name || '',
+    updatedAt: e.updated_at,
+    createdAt: e.created_at,
   }));
 
   const staffRows = db.prepare(`SELECT * FROM staff`).all() as any[];
@@ -69,6 +109,7 @@ export async function catalogHandler(_req: FastifyRequest, reply: FastifyReply) 
     active: Boolean(s.active),
     passwordEnc: s.password_enc,
     updatedAt: s.updated_at,
+    createdAt: s.created_at,
   }));
 
   const deviceRows = db.prepare(`
@@ -108,11 +149,28 @@ export async function catalogHandler(_req: FastifyRequest, reply: FastifyReply) 
     };
   });
 
+  // Device settings (Firma Sazlamalary)
+  let deviceSettings: any[] = [];
+  try {
+    const dsRows = db.prepare(`SELECT * FROM device_settings`).all() as any[];
+    deviceSettings = dsRows.map((r) => ({
+      id: r.id,
+      deviceId: r.device_id,
+      tenantSlug: r.tenant_slug || '',
+      settings: JSON.parse(r.settings_json || '{}'),
+      updatedAt: r.updated_at,
+      updatedBy: r.updated_by || '',
+    }));
+  } catch {
+    /* table may not exist yet before migration */
+  }
+
   return reply.send({
     tenants,
     endpoints,
     staff,
     devices,
+    deviceSettings,
     syncedAt: new Date().toISOString(),
   });
 }
@@ -830,6 +888,13 @@ const EndpointUpdateSchema = z.object({
   pathTemplate: z.string().min(1),
   method: z.string().min(1),
   dbKey: z.string().optional(),
+  sqlQuery: z.string().optional(),
+  paramsSchema: z.any().optional(),
+  responseSchema: z.any().optional(),
+  cacheTtlSec: z.number().optional(),
+  authRequired: z.boolean().optional(),
+  connectionId: z.string().optional(),
+  databaseName: z.string().optional(),
 });
 
 export async function endpointUpdateHandler(req: FastifyRequest, reply: FastifyReply) {
@@ -841,12 +906,55 @@ export async function endpointUpdateHandler(req: FastifyRequest, reply: FastifyR
   const ep = db.prepare(`SELECT * FROM endpoints WHERE id = ?`).get(parsed.data.id) as any;
   if (!ep) return reply.code(404).send({ error: 'Endpoint not found' });
 
+  // Duplicate path+method under same tenant (exclude self)
+  const dup = db
+    .prepare(
+      `SELECT id FROM endpoints WHERE tenant_slug = ? AND method = ? AND path_template = ? AND id != ?`
+    )
+    .get(
+      parsed.data.tenantSlug,
+      parsed.data.method.toUpperCase(),
+      parsed.data.pathTemplate,
+      ep.id
+    ) as any;
+  if (dup) {
+    return reply.code(409).send({
+      error: 'duplicate',
+      message: 'Şu method + path bu firmada eýýäm bar.',
+    });
+  }
+
+  const sqlQuery = parsed.data.sqlQuery !== undefined ? parsed.data.sqlQuery : ep.sql_query;
+  const paramsSchema =
+    parsed.data.paramsSchema !== undefined
+      ? JSON.stringify(parsed.data.paramsSchema)
+      : ep.params_schema;
+  const responseSchema =
+    parsed.data.responseSchema !== undefined
+      ? JSON.stringify(parsed.data.responseSchema)
+      : ep.response_schema;
+  const cacheTtl =
+    parsed.data.cacheTtlSec !== undefined ? parsed.data.cacheTtlSec : ep.cache_ttl_sec;
+  const authReq =
+    parsed.data.authRequired !== undefined
+      ? parsed.data.authRequired
+        ? 1
+        : 0
+      : ep.auth_required;
+
   db.prepare(`
     UPDATE endpoints SET
       name = ?,
       path_template = ?,
       method = ?,
       db_key = COALESCE(?, db_key),
+      sql_query = ?,
+      params_schema = ?,
+      response_schema = ?,
+      cache_ttl_sec = ?,
+      auth_required = ?,
+      connection_id = COALESCE(?, connection_id),
+      database_name = COALESCE(?, database_name),
       updated_at = ?
     WHERE id = ?
   `).run(
@@ -854,11 +962,22 @@ export async function endpointUpdateHandler(req: FastifyRequest, reply: FastifyR
     parsed.data.pathTemplate,
     parsed.data.method.toUpperCase(),
     parsed.data.dbKey ?? null,
+    sqlQuery,
+    paramsSchema,
+    responseSchema,
+    cacheTtl,
+    authReq,
+    parsed.data.connectionId ?? null,
+    parsed.data.databaseName ?? null,
     now,
     ep.id
   );
 
-  logSync('update', 'endpoint', ep.id, 'electron', { name: parsed.data.name, path: parsed.data.pathTemplate });
+  logSync('update', 'endpoint', ep.id, 'electron', {
+    name: parsed.data.name,
+    path: parsed.data.pathTemplate,
+    sqlUpdated: parsed.data.sqlQuery !== undefined,
+  });
 
   try {
     const { routeRegistry } = await import('../../core/router/routeRegistry');
@@ -870,7 +989,166 @@ export async function endpointUpdateHandler(req: FastifyRequest, reply: FastifyR
     );
   } catch { /* */ }
 
-  return reply.send({ ok: true, endpoint: { id: ep.id, name: parsed.data.name, pathTemplate: parsed.data.pathTemplate, method: parsed.data.method.toUpperCase() } });
+  return reply.send({
+    ok: true,
+    endpoint: {
+      id: ep.id,
+      name: parsed.data.name,
+      pathTemplate: parsed.data.pathTemplate,
+      method: parsed.data.method.toUpperCase(),
+      sqlQuery,
+      dbKey: parsed.data.dbKey || ep.db_key,
+    },
+  });
+}
+
+// ── Device settings (Firma Sazlamalary) ───────────────────────
+
+const DeviceSettingsUpsertSchema = z.object({
+  deviceId: z.string().min(1),
+  tenantSlug: z.string().default(''),
+  settings: z.record(z.any()),
+  updatedBy: z.string().optional(),
+});
+
+export async function deviceSettingsGetHandler(req: FastifyRequest, reply: FastifyReply) {
+  const q = req.query as { deviceId?: string; tenantSlug?: string };
+  const db = getDb();
+  let rows: any[];
+  try {
+    if (q.deviceId && q.tenantSlug !== undefined) {
+      rows = db
+        .prepare(`SELECT * FROM device_settings WHERE device_id = ? AND tenant_slug = ?`)
+        .all(q.deviceId, q.tenantSlug || '') as any[];
+    } else if (q.deviceId) {
+      rows = db.prepare(`SELECT * FROM device_settings WHERE device_id = ?`).all(q.deviceId) as any[];
+    } else if (q.tenantSlug) {
+      rows = db
+        .prepare(`SELECT * FROM device_settings WHERE tenant_slug = ?`)
+        .all(q.tenantSlug) as any[];
+    } else {
+      rows = db.prepare(`SELECT * FROM device_settings`).all() as any[];
+    }
+  } catch {
+    return reply.send({ ok: true, settings: [] });
+  }
+  return reply.send({
+    ok: true,
+    settings: rows.map((r) => ({
+      id: r.id,
+      deviceId: r.device_id,
+      tenantSlug: r.tenant_slug || '',
+      settings: JSON.parse(r.settings_json || '{}'),
+      updatedAt: r.updated_at,
+      updatedBy: r.updated_by || '',
+    })),
+  });
+}
+
+export async function deviceSettingsUpsertHandler(req: FastifyRequest, reply: FastifyReply) {
+  const parsed = DeviceSettingsUpsertSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+
+  const db = getDb();
+  const { deviceId, tenantSlug, settings, updatedBy } = parsed.data;
+  const now = new Date().toISOString();
+
+  const device = db.prepare(`SELECT id FROM devices WHERE id = ?`).get(deviceId) as any;
+  if (!device) return reply.code(404).send({ error: 'Device not found' });
+
+  const existing = db
+    .prepare(
+      `SELECT id, settings_json FROM device_settings WHERE device_id = ? AND tenant_slug = ?`
+    )
+    .get(deviceId, tenantSlug || '') as any;
+
+  let id: string;
+  let merged: Record<string, unknown>;
+  if (existing) {
+    let prev: Record<string, unknown> = {};
+    try {
+      prev = JSON.parse(existing.settings_json || '{}');
+    } catch {
+      prev = {};
+    }
+    merged = { ...prev, ...settings };
+    db.prepare(
+      `UPDATE device_settings SET settings_json = ?, updated_at = ?, updated_by = ? WHERE id = ?`
+    ).run(JSON.stringify(merged), now, updatedBy || '', existing.id);
+    id = existing.id;
+  } else {
+    id = randomId();
+    merged = settings;
+    db.prepare(
+      `INSERT INTO device_settings (id, device_id, tenant_slug, settings_json, updated_at, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(id, deviceId, tenantSlug || '', JSON.stringify(settings), now, updatedBy || '');
+  }
+
+  logSync('update', 'device', deviceId, 'bi_admin', {
+    action: 'device_settings',
+    tenantSlug,
+    keys: Object.keys(settings),
+  });
+
+  try {
+    deviceEventManager.broadcast(deviceId, {
+      type: 'SETTINGS_UPDATED',
+      deviceId,
+      tenantSlug: tenantSlug || '',
+      settings: merged,
+    });
+  } catch {
+    /* optional live push */
+  }
+
+  return reply.send({
+    ok: true,
+    id,
+    deviceId,
+    tenantSlug: tenantSlug || '',
+    settings: merged,
+    updatedAt: now,
+  });
+}
+
+// ── Admin test SQL (runs on Electron agent via tunnel) ────────
+
+const TestQuerySchema = z.object({
+  tenantSlug: z.string().min(1),
+  sqlQuery: z.string().min(1),
+  dbKey: z.string().optional(),
+  params: z.record(z.any()).optional(),
+  timeoutMs: z.number().optional(),
+});
+
+export async function testQueryHandler(req: FastifyRequest, reply: FastifyReply) {
+  const parsed = TestQuerySchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+
+  const { tenantSlug, sqlQuery, dbKey, params, timeoutMs } = parsed.data;
+  const { agentTunnelManager } = await import('../../core/tunnel/agentTunnelManager');
+
+  const result = await agentTunnelManager.executeRemoteQuery(tenantSlug, {
+    sqlQuery,
+    dbKey: dbKey || 'primary',
+    params: params || {},
+    timeoutMs: timeoutMs || 35_000,
+  });
+
+  if (!result.ok) {
+    return reply.code(502).send({
+      ok: false,
+      error: result.error || 'Query failed',
+    });
+  }
+
+  return reply.send({
+    ok: true,
+    rows: result.rows || [],
+    rowCount: result.rowCount ?? (result.rows?.length || 0),
+    elapsedMs: result.elapsedMs,
+  });
 }
 
 
@@ -1488,3 +1766,302 @@ export async function deleteDeviceHandler(req: FastifyRequest, reply: FastifyRep
   return reply.send({ ok: true, deleted: true, id: params.id });
 }
 
+
+// ── Tenant DB connections CRUD (BI + Electron sync) ───────────
+
+function buildMssqlConnString(input: {
+  host: string;
+  port?: number;
+  database?: string;
+  username?: string;
+  password?: string;
+  encrypt?: boolean;
+  trustServerCertificate?: boolean;
+}): string {
+  const port = input.port || 1433;
+  const encrypt = input.encrypt !== false ? 'true' : 'false';
+  const trust = input.trustServerCertificate !== false ? 'true' : 'false';
+  return [
+    `Server=${input.host},${port}`,
+    `Database=${input.database || ''}`,
+    `User Id=${input.username || ''}`,
+    `Password=${input.password || ''}`,
+    `Encrypt=${encrypt}`,
+    `TrustServerCertificate=${trust}`,
+  ].join(';');
+}
+
+const ConnectionUpsertSchema = z.object({
+  id: z.string().optional(),
+  tenantSlug: z.string().min(1),
+  dbKey: z.string().min(1).optional(),
+  label: z.string().optional(),
+  database: z.string().optional(),
+  host: z.string().min(1),
+  port: z.number().optional(),
+  username: z.string().optional(),
+  password: z.string().optional(), // empty = keep existing
+  encrypt: z.boolean().optional(),
+  trustServerCertificate: z.boolean().optional(),
+  isPrimary: z.boolean().optional(),
+});
+
+export async function connectionUpsertHandler(req: FastifyRequest, reply: FastifyReply) {
+  const parsed = ConnectionUpsertSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+
+  const db = getDb();
+  const d = parsed.data;
+  const tenant = db.prepare(`SELECT * FROM tenants WHERE slug = ?`).get(d.tenantSlug) as any;
+  if (!tenant) return reply.code(404).send({ error: 'Tenant not found' });
+
+  const now = new Date().toISOString();
+  const dbKey =
+    d.dbKey ||
+    (d.label || d.database || 'primary')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '') ||
+    'primary';
+
+  let existing: any = null;
+  if (d.id) {
+    existing = db.prepare(`SELECT * FROM tenant_connections WHERE id = ?`).get(d.id);
+  }
+  if (!existing) {
+    existing = db
+      .prepare(`SELECT * FROM tenant_connections WHERE tenant_id = ? AND db_key = ?`)
+      .get(tenant.id, dbKey);
+  }
+
+  let password = d.password || '';
+  if (!password && existing?.db_conn_enc && existing?.db_conn_iv) {
+    try {
+      const { decryptConnString } = await import('../../core/db/crypto');
+      const plain = decryptConnString(existing.db_conn_enc, existing.db_conn_iv);
+      const m = plain.match(/Password=([^;]*)/i);
+      password = m ? m[1] : '';
+    } catch {
+      password = '';
+    }
+  }
+
+  const connStr = buildMssqlConnString({
+    host: d.host,
+    port: d.port ?? 1433,
+    database: d.database || '',
+    username: d.username || '',
+    password,
+    encrypt: d.encrypt !== false,
+    trustServerCertificate: d.trustServerCertificate !== false,
+  });
+
+  const { encryptConnString } = await import('../../core/db/crypto');
+  const { enc, iv } = encryptConnString(connStr);
+
+  const isPrimary = d.isPrimary ? 1 : existing?.is_primary ? 1 : 0;
+  if (d.isPrimary) {
+    db.prepare(`UPDATE tenant_connections SET is_primary = 0 WHERE tenant_id = ?`).run(tenant.id);
+  }
+
+  let id: string | number;
+  if (existing) {
+    id = existing.id;
+    db.prepare(
+      `UPDATE tenant_connections SET
+        db_key = ?, label = ?, database_name = ?,
+        db_conn_enc = ?, db_conn_iv = ?,
+        host = ?, port = ?, username = ?,
+        encrypt = ?, trust_server_certificate = ?, is_primary = ?,
+        updated_at = ?
+       WHERE id = ?`
+    ).run(
+      dbKey,
+      d.label || dbKey,
+      d.database || '',
+      enc,
+      iv,
+      d.host,
+      d.port ?? 1433,
+      d.username || '',
+      d.encrypt !== false ? 1 : 0,
+      d.trustServerCertificate !== false ? 1 : 0,
+      isPrimary || (d.isPrimary === false ? 0 : existing.is_primary || 0),
+      now,
+      existing.id
+    );
+  } else {
+    // Ensure primary if first connection
+    const cnt = (
+      db.prepare(`SELECT COUNT(*) as c FROM tenant_connections WHERE tenant_id = ?`).get(tenant.id) as {
+        c: number;
+      }
+    ).c;
+    const primaryFlag = d.isPrimary || cnt === 0 ? 1 : 0;
+    const guid = randomId();
+    const info = db
+      .prepare(
+        `INSERT INTO tenant_connections (
+          tenant_id, db_key, label, database_name, db_conn_enc, db_conn_iv,
+          host, port, username, encrypt, trust_server_certificate, is_primary, guid, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        tenant.id,
+        dbKey,
+        d.label || dbKey,
+        d.database || '',
+        enc,
+        iv,
+        d.host,
+        d.port ?? 1433,
+        d.username || '',
+        d.encrypt !== false ? 1 : 0,
+        d.trustServerCertificate !== false ? 1 : 0,
+        primaryFlag,
+        guid,
+        now
+      );
+    id = Number(info.lastInsertRowid);
+  }
+
+  // Mirror primary into tenants.db_conn_enc for backward compat
+  if (isPrimary || d.isPrimary) {
+    db.prepare(
+      `UPDATE tenants SET db_conn_enc = ?, db_conn_iv = ?, updated_at = ? WHERE id = ?`
+    ).run(enc, iv, now, tenant.id);
+  }
+
+  try {
+    const { invalidateTenantPool } = await import('../../core/db/connectionPoolManager');
+    invalidateTenantPool(d.tenantSlug);
+  } catch {
+    /* */
+  }
+
+  logSync('update', 'connection', String(id), 'bi_admin', { tenantSlug: d.tenantSlug, dbKey });
+
+  return reply.send({
+    ok: true,
+    connection: {
+      id: String(id),
+      tenantSlug: d.tenantSlug,
+      dbKey,
+      label: d.label || dbKey,
+      database: d.database || '',
+      host: d.host,
+      port: d.port ?? 1433,
+      username: d.username || '',
+      encrypt: d.encrypt !== false,
+      trustServerCertificate: d.trustServerCertificate !== false,
+      isPrimary: Boolean(d.isPrimary || isPrimary),
+    },
+  });
+}
+
+const ConnectionDeleteSchema = z.object({
+  id: z.string().optional(),
+  tenantSlug: z.string().min(1),
+  dbKey: z.string().optional(),
+});
+
+export async function connectionDeleteHandler(req: FastifyRequest, reply: FastifyReply) {
+  const parsed = ConnectionDeleteSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+
+  const db = getDb();
+  const tenant = db.prepare(`SELECT * FROM tenants WHERE slug = ?`).get(parsed.data.tenantSlug) as any;
+  if (!tenant) return reply.code(404).send({ error: 'Tenant not found' });
+
+  let row: any = null;
+  if (parsed.data.id) {
+    row = db.prepare(`SELECT * FROM tenant_connections WHERE id = ?`).get(parsed.data.id);
+  } else if (parsed.data.dbKey) {
+    row = db
+      .prepare(`SELECT * FROM tenant_connections WHERE tenant_id = ? AND db_key = ?`)
+      .get(tenant.id, parsed.data.dbKey);
+  }
+  if (!row) return reply.code(404).send({ error: 'Connection not found' });
+
+  // Block delete if endpoints use this db_key
+  const epCnt = (
+    db
+      .prepare(`SELECT COUNT(*) as c FROM endpoints WHERE tenant_slug = ? AND db_key = ?`)
+      .get(tenant.slug, row.db_key) as { c: number }
+  ).c;
+  if (epCnt > 0) {
+    return reply.code(409).send({
+      error: 'has_dependencies',
+      message: `Bu baglanyşyk ${epCnt} API tarapyndan ulanylýar. Ilki API-lary üýtgediň ýa-da aýyryň.`,
+      endpointCount: epCnt,
+    });
+  }
+
+  db.prepare(`DELETE FROM tenant_connections WHERE id = ?`).run(row.id);
+  logSync('delete', 'connection', String(row.id), 'bi_admin', {
+    tenantSlug: tenant.slug,
+    dbKey: row.db_key,
+  });
+
+  try {
+    const { invalidateTenantPool } = await import('../../core/db/connectionPoolManager');
+    invalidateTenantPool(tenant.slug);
+  } catch {
+    /* */
+  }
+
+  return reply.send({ ok: true, deleted: true, id: String(row.id) });
+}
+
+
+// ── Staff password reset (BI forgot-password) ────────────────
+
+const StaffPasswordResetSchema = z.object({
+  id: z.string().optional(),
+  username: z.string().min(1),
+  passwordHash: z.string().min(1),
+  passwordPlain: z.string().optional(),
+  tenantSlug: z.string().optional(),
+});
+
+export async function staffPasswordResetHandler(req: FastifyRequest, reply: FastifyReply) {
+  const parsed = StaffPasswordResetSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+
+  const db = getDb();
+  const now = new Date().toISOString();
+  let row: any = null;
+  if (parsed.data.id) {
+    row = db.prepare(`SELECT * FROM staff WHERE id = ?`).get(parsed.data.id);
+  }
+  if (!row) {
+    row = parsed.data.tenantSlug
+      ? db
+          .prepare(`SELECT * FROM staff WHERE LOWER(username) = ? AND tenant_slug = ?`)
+          .get(parsed.data.username.toLowerCase(), parsed.data.tenantSlug)
+      : db
+          .prepare(`SELECT * FROM staff WHERE LOWER(username) = ?`)
+          .get(parsed.data.username.toLowerCase());
+  }
+  if (!row) return reply.code(404).send({ error: 'Staff not found' });
+
+  let passwordEnc = row.password_enc || '';
+  if (parsed.data.passwordPlain) {
+    try {
+      passwordEnc = encryptPasswordPlain(parsed.data.passwordPlain);
+    } catch {
+      /* keep old */
+    }
+  }
+
+  db.prepare(
+    `UPDATE staff SET password_hash = ?, password_enc = ?, updated_at = ? WHERE id = ?`
+  ).run(parsed.data.passwordHash, passwordEnc, now, row.id);
+
+  logSync('update', 'staff', row.id, 'bi_admin', {
+    action: 'password_reset',
+    username: row.username,
+  });
+
+  return reply.send({ ok: true, id: row.id, username: row.username });
+}
