@@ -1,0 +1,5 @@
+node_modules/
+.env
+*.log
+vps-gateway.zip
+vps-gateway.rar

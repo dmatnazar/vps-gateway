@@ -1,0 +1,13 @@
+feat(admin): implement device settings and enhanced connection management
+
+Add support for per-device and per-tenant settings via new API endpoints
+and database schema. Expand tenant connection metadata to include host,
+port, and authentication details for improved administrative control.
+
+- Implement `device_settings` table and corresponding CRUD routes
+- Update `tenant_connections` schema to support structured connection info
+- Enhance `catalogHandler` to provide detailed tenant, staff, and device
+  statistics
+- Add `SETTINGS_UPDATED` event type to `DeviceEventPayload`
+- Add administrative routes for connection management and staff password
+  resets
