@@ -57,15 +57,48 @@ export const tenantRepository = {
   async replaceConnections(tenantId: string, connections: TenantConnectionRecord[]) {
     const db = getDb();
     const now = new Date().toISOString();
+    const cols = (db.prepare(`PRAGMA table_info(tenant_connections)`).all() as { name: string }[]).map(
+      (r) => r.name
+    );
+    const hasPrimary = cols.includes('is_primary');
+    const hasHost = cols.includes('host');
 
     const tx = db.transaction(() => {
       db.prepare(`DELETE FROM tenant_connections WHERE tenant_id = ?`).run(tenantId);
-      const stmt = db.prepare(`
-        INSERT INTO tenant_connections (tenant_id, db_key, label, database_name, db_conn_enc, db_conn_iv)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `);
-      for (const c of connections) {
-        stmt.run(tenantId, c.dbKey, c.label || '', c.database || '', c.dbConnEnc, c.dbConnIv);
+      if (hasPrimary && hasHost) {
+        const stmt = db.prepare(`
+          INSERT INTO tenant_connections (
+            tenant_id, db_key, label, database_name, db_conn_enc, db_conn_iv,
+            host, port, username, encrypt, trust_server_certificate, is_primary, guid, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        for (const c of connections) {
+          const anyC = c as any;
+          stmt.run(
+            tenantId,
+            c.dbKey,
+            c.label || '',
+            c.database || '',
+            c.dbConnEnc,
+            c.dbConnIv,
+            anyC.host || '',
+            anyC.port ?? 1433,
+            anyC.username || '',
+            anyC.encrypt === false ? 0 : 1,
+            anyC.trustServerCertificate === false ? 0 : 1,
+            anyC.isPrimary ? 1 : 0,
+            anyC.guid || anyC.id || '',
+            now
+          );
+        }
+      } else {
+        const stmt = db.prepare(`
+          INSERT INTO tenant_connections (tenant_id, db_key, label, database_name, db_conn_enc, db_conn_iv)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `);
+        for (const c of connections) {
+          stmt.run(tenantId, c.dbKey, c.label || '', c.database || '', c.dbConnEnc, c.dbConnIv);
+        }
       }
       db.prepare(`UPDATE tenants SET updated_at = ? WHERE id = ?`).run(now, tenantId);
     });

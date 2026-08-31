@@ -4,7 +4,7 @@ import { tenantRepository } from '../tenant/tenant.repository';
 import { routeRegistry } from '../../core/router/routeRegistry';
 import { invalidateTenantPool } from '../../core/db/connectionPoolManager';
 import { encryptConnString } from '../../core/db/crypto';
-import { logSync } from '../../store/sqliteDb';
+import { logSync, getDb } from '../../store/sqliteDb';
 
 const ParamDefSchema = z.object({
   name: z.string().min(1),
@@ -74,6 +74,20 @@ const SyncSchema = z.object({
 });
 
 export async function syncSchemaHandler(req: FastifyRequest, reply: FastifyReply) {
+  // Electron sync → refresh device online status
+  try {
+    const h = req.headers as Record<string, string | undefined>;
+    const deviceId = h['x-device-id'] || '';
+    if (deviceId) {
+      getDb()
+        .prepare(
+          `UPDATE devices SET last_seen_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`
+        )
+        .run(deviceId);
+    }
+  } catch {
+    /* */
+  }
   const parsed = SyncSchema.safeParse(req.body);
   if (!parsed.success) {
     return reply.code(400).send({ error: parsed.error.flatten() });
@@ -85,12 +99,30 @@ export async function syncSchemaHandler(req: FastifyRequest, reply: FastifyReply
   const encryptedConnections =
     connections?.map((c) => {
       const { enc, iv } = encryptConnString(c.connectionString);
+      let host = '';
+      let port = 1433;
+      let username = '';
+      try {
+        const { parseConnectionString } = require('../../core/db/connectionPoolManager');
+        const p = parseConnectionString(c.connectionString);
+        host = p.server || '';
+        port = p.port || 1433;
+        username = p.user || '';
+      } catch {
+        /* */
+      }
       return {
         dbKey: c.dbKey,
         label: c.label || c.dbKey,
         database: c.database,
         dbConnEnc: enc,
         dbConnIv: iv,
+        isPrimary: Boolean(c.isPrimary),
+        host,
+        port,
+        username,
+        encrypt: true,
+        trustServerCertificate: true,
       };
     }) ?? undefined;
 
@@ -132,22 +164,40 @@ export async function syncSchemaHandler(req: FastifyRequest, reply: FastifyReply
     })) as any
   );
 
-  // Electron device that pushed schema → auto-bind firm to that device
+  // Electron device that pushed schema → bind firm to that device (1 firm = 1 device)
   try {
     const deviceId = (req.headers['x-device-id'] as string) || '';
     if (deviceId) {
       const db = (await import('../../store/sqliteDb')).getDb();
       const { randomUUID } = await import('crypto');
+      const other = db
+        .prepare(
+          `SELECT device_id FROM device_assignments WHERE tenant_slug = ? AND device_id != ? LIMIT 1`
+        )
+        .get(tenantSlug, deviceId) as { device_id?: string } | undefined;
+      if (other?.device_id) {
+        return reply.code(409).send({
+          error: `Firma "${tenantSlug}" eýýäm başga enjama bagly. Bir firma diňe bir enjama baglanyp bilýär.`,
+          code: 'FIRM_ALREADY_ASSIGNED',
+          deviceId: other.device_id,
+          tenantSlug,
+        });
+      }
       const exists = db
         .prepare(`SELECT id FROM device_assignments WHERE device_id = ? AND tenant_slug = ?`)
         .get(deviceId, tenantSlug) as any;
+      const nowA = new Date().toISOString();
       if (!exists) {
-        const nowA = new Date().toISOString();
         db.prepare(
           `INSERT INTO device_assignments (id, device_id, tenant_slug, endpoint_id, description, created_at, updated_at)
            VALUES (?, ?, ?, NULL, 'auto-sync-schema', ?, ?)`
         ).run(randomUUID(), deviceId, tenantSlug, nowA, nowA);
       }
+      db.prepare(`UPDATE devices SET last_seen_at = ?, updated_at = ? WHERE id = ?`).run(
+        nowA,
+        nowA,
+        deviceId
+      );
     }
   } catch (e) {
     console.warn('[sync-schema] auto device assign failed', e);

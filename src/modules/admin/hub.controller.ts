@@ -3,7 +3,9 @@ import { z } from 'zod';
 import crypto from 'node:crypto';
 import { getDb, logSync } from '../../store/sqliteDb';
 import { tenantRepository } from '../tenant/tenant.repository';
-import { encryptPasswordPlain } from '../../core/db/passwordEnc';
+import { encryptPasswordPlain, decryptPasswordPlain } from '../../core/db/passwordEnc';
+import { decryptConnString } from '../../core/db/crypto';
+import { parseConnectionString } from '../../core/db/connectionPoolManager';
 import { deviceEventManager } from '../../core/tunnel/deviceEventManager';
 import type {
   StaffRecord,
@@ -25,7 +27,26 @@ const randomId = () => {
 
 // ── Catalog ──────────────────────────────────────────────────
 
-export async function catalogHandler(_req: FastifyRequest, reply: FastifyReply) {
+
+/** Update devices.last_seen_at when Electron identifies itself */
+function touchDeviceLastSeen(req: FastifyRequest) {
+  try {
+    const h = req.headers as Record<string, string | string[] | undefined>;
+    const id =
+      (typeof h['x-device-id'] === 'string' && h['x-device-id']) ||
+      (typeof h['x-deviceid'] === 'string' && h['x-deviceid']) ||
+      '';
+    if (!id) return;
+    const now = new Date().toISOString();
+    const db = getDb();
+    db.prepare(`UPDATE devices SET last_seen_at = ?, updated_at = ? WHERE id = ?`).run(now, now, id);
+  } catch (e) {
+    console.warn('[touchDeviceLastSeen]', e);
+  }
+}
+
+export async function catalogHandler(req: FastifyRequest, reply: FastifyReply) {
+  touchDeviceLastSeen(req);
   const db = getDb();
 
   // Return all tenants (active + passive) so admin UIs can show / reactivate them
@@ -45,22 +66,48 @@ export async function catalogHandler(_req: FastifyRequest, reply: FastifyReply) 
 
   const tenants = tenantRows.map((t) => {
     const rawConns = connStmt.all(t.id) as any[];
-    const connections = rawConns.map((c) => ({
-      id: String(c.id),
-      guid: c.guid || String(c.id),
-      dbKey: c.db_key,
-      label: c.label || c.db_key,
-      database: c.database_name || '',
-      host: c.host || '',
-      port: c.port ?? 1433,
-      username: c.username || '',
-      encrypt: c.encrypt === undefined ? true : Boolean(c.encrypt),
-      trustServerCertificate:
-        c.trust_server_certificate === undefined ? true : Boolean(c.trust_server_certificate),
-      isPrimary: Boolean(c.is_primary),
-      hasPassword: Boolean(c.db_conn_enc),
-      updatedAt: c.updated_at || null,
-    }));
+    const connections = rawConns.map((c) => {
+      let host = c.host || '';
+      let port = c.port ?? 1433;
+      let username = c.username || '';
+      let database = c.database_name || '';
+      let password = '';
+      let encrypt = c.encrypt === undefined ? true : Boolean(c.encrypt);
+      let trustServerCertificate =
+        c.trust_server_certificate === undefined ? true : Boolean(c.trust_server_certificate);
+      // Decrypt stored connection string so BI edit form gets Host/User/Password
+      if (c.db_conn_enc && c.db_conn_iv) {
+        try {
+          const plain = decryptConnString(c.db_conn_enc, c.db_conn_iv);
+          const parsed = parseConnectionString(plain);
+          if (!host) host = parsed.server || '';
+          if (!port) port = parsed.port || 1433;
+          if (!username) username = parsed.user || '';
+          if (!database) database = parsed.database || '';
+          if (parsed.password) password = parsed.password;
+          encrypt = parsed.encrypt;
+          trustServerCertificate = parsed.trustServerCertificate;
+        } catch (e) {
+          console.warn('[catalog] decrypt conn', c.id, e);
+        }
+      }
+      return {
+        id: String(c.id),
+        guid: c.guid || String(c.id),
+        dbKey: c.db_key,
+        label: c.label || c.db_key,
+        database,
+        host,
+        port,
+        username,
+        password, // admin catalog only — needed for BI edit form
+        encrypt,
+        trustServerCertificate,
+        isPrimary: Boolean(c.is_primary),
+        hasPassword: Boolean(c.db_conn_enc || password),
+        updatedAt: c.updated_at || null,
+      };
+    });
     let billing: any = null;
     try {
       const w = db.prepare(`SELECT * FROM tenant_wallets WHERE tenant_id = ?`).get(t.id) as any;
@@ -137,20 +184,29 @@ export async function catalogHandler(_req: FastifyRequest, reply: FastifyReply) 
   }));
 
   const staffRows = db.prepare(`SELECT * FROM staff`).all() as any[];
-  const staff = staffRows.map((s) => ({
-    id: s.id,
-    tenantSlug: s.tenant_slug,
-    tenantSlugs: JSON.parse(s.tenant_slugs || '[]'),
-    fullName: s.full_name,
-    username: s.username,
-    role: s.role,
-    phone: s.phone,
-    email: s.email,
-    active: Boolean(s.active),
-    passwordEnc: s.password_enc,
-    updatedAt: s.updated_at,
-    createdAt: s.created_at,
-  }));
+  const staff = staffRows.map((s) => {
+    let password = '';
+    try {
+      if (s.password_enc) password = decryptPasswordPlain(s.password_enc) || '';
+    } catch {
+      /* */
+    }
+    return {
+      id: s.id,
+      tenantSlug: s.tenant_slug,
+      tenantSlugs: JSON.parse(s.tenant_slugs || '[]'),
+      fullName: s.full_name,
+      username: s.username,
+      role: s.role,
+      phone: s.phone,
+      email: s.email,
+      active: Boolean(s.active),
+      passwordEnc: s.password_enc,
+      password, // plaintext for BI/Electron admin forms (HMAC-protected admin catalog)
+      updatedAt: s.updated_at,
+      createdAt: s.created_at,
+    };
+  });
 
   const deviceRows = db.prepare(`
     SELECT d.*, t.name as company_name, t.slug as company_slug,
@@ -223,41 +279,43 @@ const CreateTenantSchema = z.object({
 });
 
 /** Electron device creates tenant → auto-assign that device (no BI step required) */
-function ensureDeviceAssignment(db: any, deviceId: string | undefined, tenantSlug: string) {
-  if (!deviceId || !tenantSlug) return;
+function ensureDeviceAssignment(db: any, deviceId: string | undefined, tenantSlug: string): { ok: boolean; error?: string } {
+  if (!deviceId || !tenantSlug) return { ok: true };
   try {
     const device = db.prepare(`SELECT id, status FROM devices WHERE id = ?`).get(deviceId) as any;
-    if (!device) return;
+    if (!device) return { ok: false, error: 'Device not found' };
+    // 1 firm = 1 device: block if another device already has this firm
+    const other = db
+      .prepare(
+        `SELECT device_id FROM device_assignments WHERE tenant_slug = ? AND device_id != ? LIMIT 1`
+      )
+      .get(tenantSlug, deviceId) as { device_id?: string } | undefined;
+    if (other?.device_id) {
+      return {
+        ok: false,
+        error: `Firma "${tenantSlug}" eýýäm başga enjama bagly. Bir firma diňe bir enjama baglanyp bilýär.`,
+      };
+    }
     const exists = db
       .prepare(`SELECT id FROM device_assignments WHERE device_id = ? AND tenant_slug = ?`)
       .get(deviceId, tenantSlug) as any;
-    if (exists) return;
+    if (exists) return { ok: true };
     const now = new Date().toISOString();
+    const { randomUUID } = require('crypto');
     db.prepare(
       `INSERT INTO device_assignments (id, device_id, tenant_slug, endpoint_id, description, created_at, updated_at)
        VALUES (?, ?, ?, NULL, 'auto-from-electron', ?, ?)`
-    ).run(randomId(), deviceId, tenantSlug, now, now);
-    // Keep primary tenant_slug if empty
+    ).run(randomUUID(), deviceId, tenantSlug, now, now);
     db.prepare(
-      `UPDATE devices SET tenant_slug = COALESCE(NULLIF(tenant_slug, ''), ?), updated_at = datetime('now') WHERE id = ?`
-    ).run(tenantSlug, deviceId);
-    try {
-      deviceEventManager.broadcast(deviceId, {
-        type: 'DEVICE_UPDATED',
-        deviceId,
-        status: device.status,
-        companySlugs: (
-          db.prepare(`SELECT tenant_slug FROM device_assignments WHERE device_id = ?`).all(deviceId) as any[]
-        ).map((r) => r.tenant_slug),
-      });
-    } catch {
-      /* */
-    }
-    logSync('update', 'device', deviceId, 'api', { autoAssign: tenantSlug });
+      `UPDATE devices SET tenant_slug = COALESCE(NULLIF(tenant_slug, ''), ?), last_seen_at = ?, updated_at = ? WHERE id = ?`
+    ).run(tenantSlug, now, now, deviceId);
+    return { ok: true };
   } catch (e) {
     console.warn('[ensureDeviceAssignment]', e);
+    return { ok: false, error: String(e) };
   }
 }
+
 
 export async function createTenantHandler(req: FastifyRequest, reply: FastifyReply) {
   const parsed = CreateTenantSchema.safeParse(req.body);
@@ -320,6 +378,7 @@ const StaffSyncSchema = z.object({
 });
 
 export async function syncStaffHandler(req: FastifyRequest, reply: FastifyReply) {
+  touchDeviceLastSeen(req);
   const parsed = StaffSyncSchema.safeParse(req.body);
   if (!parsed.success) {
     return reply.code(400).send({ error: parsed.error.flatten() });
@@ -1965,7 +2024,14 @@ export async function deviceStatusHandler(req: FastifyRequest, reply: FastifyRep
     });
   }
 
-  db.prepare(`UPDATE devices SET last_seen_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`).run(query.deviceId);
+  {
+    const now = new Date().toISOString();
+    db.prepare(`UPDATE devices SET last_seen_at = ?, updated_at = ? WHERE id = ?`).run(
+      now,
+      now,
+      query.deviceId
+    );
+  }
 
   const assignments = db.prepare(`
     SELECT da.tenant_slug, t.name as tenant_name
