@@ -32,6 +32,8 @@ interface DeviceConnection {
 class DeviceEventManager {
   private connections = new Map<string, Set<DeviceConnection>>();
   private pingInterval: NodeJS.Timeout | null = null;
+  private static readonly PONG_TIMEOUT_MS = 55_000;
+  private static readonly PING_INTERVAL_MS = 15_000;
 
   constructor() {
     this.startHeartbeat();
@@ -41,30 +43,48 @@ class DeviceEventManager {
     if (this.pingInterval) clearInterval(this.pingInterval);
     this.pingInterval = setInterval(() => {
       const now = new Date();
-      for (const [deviceId, connSet] of this.connections.entries()) {
-        for (const conn of connSet) {
-          if (conn.socket.readyState === 1 /* OPEN */) {
-            try {
-              conn.lastPingAt = now;
-              conn.socket.send(JSON.stringify({ type: 'PING', timestamp: now.toISOString() }));
-            } catch {
-              this.removeConnection(conn);
+      const nowMs = now.getTime();
+      for (const [, connSet] of this.connections.entries()) {
+        for (const conn of Array.from(connSet)) {
+          if (conn.socket.readyState !== 1 /* OPEN */) {
+            this.removeConnection(conn);
+            continue;
+          }
+          const silentMs = nowMs - conn.lastPongAt.getTime();
+          if (silentMs > DeviceEventManager.PONG_TIMEOUT_MS) {
+            console.warn(
+              `[DeviceEvents] ⚠️ No PONG from device "${conn.deviceId}" for ${Math.round(silentMs / 1000)}s — dropping`
+            );
+            this.removeConnection(conn);
+            continue;
+          }
+          try {
+            conn.lastPingAt = now;
+            conn.socket.send(JSON.stringify({ type: 'PING', timestamp: now.toISOString() }));
+            const sock = conn.socket as WebSocket & { ping?: () => void };
+            if (typeof sock.ping === 'function') {
+              try {
+                sock.ping();
+              } catch {
+                /* */
+              }
             }
-          } else {
+          } catch {
             this.removeConnection(conn);
           }
         }
       }
-    }, 20_000);
+    }, DeviceEventManager.PING_INTERVAL_MS);
   }
 
   public register(deviceId: string, socket: WebSocket): DeviceConnection {
+    const now = new Date();
     const conn: DeviceConnection = {
       socket,
       deviceId,
-      connectedAt: new Date(),
-      lastPingAt: new Date(),
-      lastPongAt: new Date(),
+      connectedAt: now,
+      lastPingAt: now,
+      lastPongAt: now,
     };
 
     if (!this.connections.has(deviceId)) {
@@ -86,6 +106,9 @@ class DeviceEventManager {
 
     socket.on('close', () => this.removeConnection(conn));
     socket.on('error', () => this.removeConnection(conn));
+    socket.on('pong', () => {
+      conn.lastPongAt = new Date();
+    });
 
     console.log(`[DeviceEvents] 🟢 Device "${deviceId}" connected for real-time events`);
     return conn;

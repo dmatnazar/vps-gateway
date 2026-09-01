@@ -3,3 +3,7 @@ node_modules/
 *.log
 vps-gateway.zip
 vps-gateway.rar
+*data
+data/gateway.db
+data/gateway.db-shm
+data/gateway.db-wal
