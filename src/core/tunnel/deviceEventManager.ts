@@ -8,7 +8,9 @@ export interface DeviceEventPayload {
     | 'COMPANY_ASSIGNED'
     | 'COMPANY_REMOVED'
     | 'DEVICE_UPDATED'
-    | 'SETTINGS_UPDATED';
+    | 'SETTINGS_UPDATED'
+    | 'DEVICE_RESTART'
+    | 'DEVICE_CHECK_UPDATE';
   deviceId: string;
   status?: string;
   companySlugs?: string[];

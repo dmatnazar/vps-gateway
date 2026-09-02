@@ -1375,43 +1375,181 @@ export async function endpointDeleteHandler(req: FastifyRequest, reply: FastifyR
   });
 }
 
-// ── Device settings (Firma Sazlamalary) ───────────────────────
+// ── Device settings (Firma Sazlamalary) — device_app_settings columns ──
 
 const DeviceSettingsUpsertSchema = z.object({
   deviceId: z.string().min(1),
   tenantSlug: z.string().default(''),
   settings: z.record(z.any()),
   updatedBy: z.string().optional(),
+  /** Client clock ISO — LWW: reject if server row is strictly newer */
+  clientUpdatedAt: z.string().optional(),
 });
+
+/** Row → API settings object (camelCase, interval in seconds) */
+function rowToDeviceAppSettings(r: any): Record<string, unknown> {
+  return {
+    autostart: Boolean(r.autostart),
+    startMinimized: Boolean(r.start_minimized),
+    trayMinimize: r.tray_minimize !== 0 && r.tray_minimize !== false,
+    autoLogin: Boolean(r.auto_login),
+    autoLoginUsername: String(r.auto_login_username || ''),
+    autoSync: r.auto_sync !== 0 && r.auto_sync !== false,
+    /** Canonical: seconds */
+    syncIntervalSec: Number(r.sync_interval_sec) || 30,
+    /** Deprecated alias for older Electron builds */
+    syncIntervalMin: Math.max(1, Math.round((Number(r.sync_interval_sec) || 30) / 60)),
+    offlineQueue: r.offline_queue !== 0 && r.offline_queue !== false,
+    notifyOnSync: r.notify_on_sync !== 0 && r.notify_on_sync !== false,
+    autoSignOutMin: Math.max(0, Number(r.auto_sign_out_min) || 0),
+    theme: String(r.theme || 'dark'),
+    language: String(r.language || 'tk'),
+  };
+}
+
+/** Normalize incoming settings patch → column values (sync always in seconds) */
+function normalizeDeviceAppPatch(
+  prev: Record<string, unknown>,
+  patch: Record<string, unknown>
+): {
+  cols: {
+    autostart: number;
+    start_minimized: number;
+    tray_minimize: number;
+    auto_login: number;
+    auto_sync: number;
+    sync_interval_sec: number;
+    offline_queue: number;
+    notify_on_sync: number;
+    auto_sign_out_min: number;
+    theme: string;
+    language: string;
+  };
+  merged: Record<string, unknown>;
+} {
+  const m = { ...prev, ...patch };
+
+  let sec = Number(m.syncIntervalSec ?? m.sync_interval_sec ?? 0);
+  if (!sec || sec <= 0) {
+    const min = Number(m.syncIntervalMin ?? m.sync_interval_min ?? 0);
+    // BI historically sent "minutes"; Electron UI uses seconds (15, 30, 60, 300)
+    // If value looks like minutes (1–14) convert; if already large, treat as seconds
+    if (min > 0 && min <= 14) sec = Math.round(min * 60);
+    else if (min > 14) sec = Math.round(min); // already seconds misnamed as Min
+    else sec = 30;
+  }
+  // Cap: 0 = manual-only represented as 0; else min 15s max 24h
+  if (sec < 0) sec = 0;
+  if (sec > 0 && sec < 15) sec = 15;
+  if (sec > 86400) sec = 86400;
+
+  m.syncIntervalSec = sec;
+  m.syncIntervalMin = sec > 0 ? Math.max(1, Math.round(sec / 60)) : 0;
+
+  const autoLoginUsername = String(m.autoLoginUsername ?? m.auto_login_username ?? '').trim();
+
+  const cols = {
+    autostart: m.autostart ? 1 : 0,
+    start_minimized: m.startMinimized || m.start_minimized ? 1 : 0,
+    tray_minimize: m.trayMinimize === false || m.tray_minimize === false ? 0 : 1,
+    auto_login: m.autoLogin || m.auto_login ? 1 : 0,
+    auto_login_username: autoLoginUsername,
+    auto_sync: m.autoSync === false || m.auto_sync === false ? 0 : 1,
+    sync_interval_sec: sec,
+    offline_queue: m.offlineQueue === false || m.offline_queue === false ? 0 : 1,
+    notify_on_sync: m.notifyOnSync === false || m.notify_on_sync === false ? 0 : 1,
+    auto_sign_out_min: Math.max(0, Number(m.autoSignOutMin ?? m.auto_sign_out_min ?? 0) || 0),
+    theme: String(m.theme || 'dark'),
+    language: String(m.language || 'tk'),
+  };
+
+  const merged = {
+    autostart: Boolean(cols.autostart),
+    startMinimized: Boolean(cols.start_minimized),
+    trayMinimize: Boolean(cols.tray_minimize),
+    autoLogin: Boolean(cols.auto_login),
+    autoLoginUsername: cols.auto_login_username,
+    autoSync: Boolean(cols.auto_sync),
+    syncIntervalSec: cols.sync_interval_sec,
+    syncIntervalMin: cols.sync_interval_sec > 0 ? Math.max(1, Math.round(cols.sync_interval_sec / 60)) : 0,
+    offlineQueue: Boolean(cols.offline_queue),
+    notifyOnSync: Boolean(cols.notify_on_sync),
+    autoSignOutMin: cols.auto_sign_out_min,
+    theme: cols.theme,
+    language: cols.language,
+  };
+
+  return { cols, merged };
+}
 
 export async function deviceSettingsGetHandler(req: FastifyRequest, reply: FastifyReply) {
   const q = req.query as { deviceId?: string; tenantSlug?: string };
   const db = getDb();
-  let rows: any[];
+  let rows: any[] = [];
   try {
+    // Prefer structured table
     if (q.deviceId && q.tenantSlug !== undefined) {
       rows = db
-        .prepare(`SELECT * FROM device_settings WHERE device_id = ? AND tenant_slug = ?`)
+        .prepare(`SELECT * FROM device_app_settings WHERE device_id = ? AND tenant_slug = ?`)
         .all(q.deviceId, q.tenantSlug || '') as any[];
     } else if (q.deviceId) {
-      rows = db.prepare(`SELECT * FROM device_settings WHERE device_id = ?`).all(q.deviceId) as any[];
+      rows = db.prepare(`SELECT * FROM device_app_settings WHERE device_id = ?`).all(q.deviceId) as any[];
     } else if (q.tenantSlug) {
       rows = db
-        .prepare(`SELECT * FROM device_settings WHERE tenant_slug = ?`)
+        .prepare(`SELECT * FROM device_app_settings WHERE tenant_slug = ?`)
         .all(q.tenantSlug) as any[];
     } else {
-      rows = db.prepare(`SELECT * FROM device_settings`).all() as any[];
+      rows = db.prepare(`SELECT * FROM device_app_settings`).all() as any[];
     }
   } catch {
-    return reply.send({ ok: true, settings: [] });
+    rows = [];
   }
+
+  // Fallback to legacy JSON table if structured empty
+  if (rows.length === 0) {
+    try {
+      let legacy: any[] = [];
+      if (q.deviceId && q.tenantSlug !== undefined) {
+        legacy = db
+          .prepare(`SELECT * FROM device_settings WHERE device_id = ? AND tenant_slug = ?`)
+          .all(q.deviceId, q.tenantSlug || '') as any[];
+      } else if (q.deviceId) {
+        legacy = db.prepare(`SELECT * FROM device_settings WHERE device_id = ?`).all(q.deviceId) as any[];
+      } else {
+        legacy = [];
+      }
+      return reply.send({
+        ok: true,
+        settings: legacy.map((r) => {
+          let s: Record<string, unknown> = {};
+          try {
+            s = JSON.parse(r.settings_json || '{}');
+          } catch {
+            s = {};
+          }
+          const { merged } = normalizeDeviceAppPatch({}, s);
+          return {
+            id: r.id,
+            deviceId: r.device_id,
+            tenantSlug: r.tenant_slug || '',
+            settings: merged,
+            updatedAt: r.updated_at,
+            updatedBy: r.updated_by || '',
+          };
+        }),
+      });
+    } catch {
+      return reply.send({ ok: true, settings: [] });
+    }
+  }
+
   return reply.send({
     ok: true,
     settings: rows.map((r) => ({
       id: r.id,
       deviceId: r.device_id,
       tenantSlug: r.tenant_slug || '',
-      settings: JSON.parse(r.settings_json || '{}'),
+      settings: rowToDeviceAppSettings(r),
       updatedAt: r.updated_at,
       updatedBy: r.updated_by || '',
     })),
@@ -1423,52 +1561,135 @@ export async function deviceSettingsUpsertHandler(req: FastifyRequest, reply: Fa
   if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
 
   const db = getDb();
-  const { deviceId, tenantSlug, settings, updatedBy } = parsed.data;
+  const { deviceId, tenantSlug, settings, updatedBy, clientUpdatedAt } = parsed.data;
   const now = new Date().toISOString();
+  const slug = tenantSlug || '';
 
   const device = db.prepare(`SELECT id FROM devices WHERE id = ?`).get(deviceId) as any;
   if (!device) return reply.code(404).send({ error: 'Device not found' });
 
-  const existing = db
-    .prepare(
-      `SELECT id, settings_json FROM device_settings WHERE device_id = ? AND tenant_slug = ?`
-    )
-    .get(deviceId, tenantSlug || '') as any;
-
-  let id: string;
-  let merged: Record<string, unknown>;
-  if (existing) {
-    let prev: Record<string, unknown> = {};
-    try {
-      prev = JSON.parse(existing.settings_json || '{}');
-    } catch {
-      prev = {};
+  let prev: Record<string, unknown> = {};
+  let existingId: string | null = null;
+  let existingUpdatedAt = '';
+  try {
+    const existing = db
+      .prepare(`SELECT * FROM device_app_settings WHERE device_id = ? AND tenant_slug = ?`)
+      .get(deviceId, slug) as any;
+    if (existing) {
+      existingId = existing.id;
+      existingUpdatedAt = String(existing.updated_at || '');
+      prev = rowToDeviceAppSettings(existing);
     }
-    merged = { ...prev, ...settings };
-    db.prepare(
-      `UPDATE device_settings SET settings_json = ?, updated_at = ?, updated_by = ? WHERE id = ?`
-    ).run(JSON.stringify(merged), now, updatedBy || '', existing.id);
-    id = existing.id;
-  } else {
-    id = randomId();
-    merged = settings;
-    db.prepare(
-      `INSERT INTO device_settings (id, device_id, tenant_slug, settings_json, updated_at, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(id, deviceId, tenantSlug || '', JSON.stringify(settings), now, updatedBy || '');
+  } catch {
+    /* table may not exist yet on very old builds — migration should have run */
+  }
+
+  // LWW: if client sends older timestamp than server, keep server (do not overwrite)
+  if (clientUpdatedAt && existingUpdatedAt) {
+    const cTs = Date.parse(clientUpdatedAt);
+    const sTs = Date.parse(existingUpdatedAt);
+    if (Number.isFinite(cTs) && Number.isFinite(sTs) && sTs > cTs) {
+      return reply.send({
+        ok: true,
+        skipped: true,
+        reason: 'server_newer',
+        id: existingId,
+        deviceId,
+        tenantSlug: slug,
+        settings: prev,
+        updatedAt: existingUpdatedAt,
+      });
+    }
+  }
+
+  const { cols, merged } = normalizeDeviceAppPatch(prev, settings);
+  const id = existingId || randomId();
+
+  // Ensure auto_login_username column exists (older DBs may miss v11)
+  try {
+    const cols = (db.prepare(`PRAGMA table_info(device_app_settings)`).all() as { name: string }[]).map(
+      (c) => c.name
+    );
+    if (!cols.includes('auto_login_username')) {
+      db.exec(`ALTER TABLE device_app_settings ADD COLUMN auto_login_username TEXT DEFAULT ''`);
+    }
+  } catch {
+    /* */
+  }
+
+  db.prepare(
+    `INSERT INTO device_app_settings (
+      id, device_id, tenant_slug,
+      autostart, start_minimized, tray_minimize, auto_login, auto_login_username,
+      auto_sync, sync_interval_sec, offline_queue, notify_on_sync,
+      auto_sign_out_min, theme, language, updated_at, updated_by
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(device_id, tenant_slug) DO UPDATE SET
+      autostart=excluded.autostart,
+      start_minimized=excluded.start_minimized,
+      tray_minimize=excluded.tray_minimize,
+      auto_login=excluded.auto_login,
+      auto_login_username=excluded.auto_login_username,
+      auto_sync=excluded.auto_sync,
+      sync_interval_sec=excluded.sync_interval_sec,
+      offline_queue=excluded.offline_queue,
+      notify_on_sync=excluded.notify_on_sync,
+      auto_sign_out_min=excluded.auto_sign_out_min,
+      theme=excluded.theme,
+      language=excluded.language,
+      updated_at=excluded.updated_at,
+      updated_by=excluded.updated_by`
+  ).run(
+    id,
+    deviceId,
+    slug,
+    cols.autostart,
+    cols.start_minimized,
+    cols.tray_minimize,
+    cols.auto_login,
+    cols.auto_login_username,
+    cols.auto_sync,
+    cols.sync_interval_sec,
+    cols.offline_queue,
+    cols.notify_on_sync,
+    cols.auto_sign_out_min,
+    cols.theme,
+    cols.language,
+    now,
+    updatedBy || ''
+  );
+
+  // Mirror to legacy device_settings JSON for older clients / catalog
+  try {
+    const leg = db
+      .prepare(`SELECT id FROM device_settings WHERE device_id = ? AND tenant_slug = ?`)
+      .get(deviceId, slug) as any;
+    if (leg) {
+      db.prepare(
+        `UPDATE device_settings SET settings_json = ?, updated_at = ?, updated_by = ? WHERE id = ?`
+      ).run(JSON.stringify(merged), now, updatedBy || '', leg.id);
+    } else {
+      db.prepare(
+        `INSERT INTO device_settings (id, device_id, tenant_slug, settings_json, updated_at, updated_by)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(id, deviceId, slug, JSON.stringify(merged), now, updatedBy || '');
+    }
+  } catch {
+    /* optional */
   }
 
   logSync('update', 'device', deviceId, 'bi_admin', {
-    action: 'device_settings',
-    tenantSlug,
+    action: 'device_app_settings',
+    tenantSlug: slug,
     keys: Object.keys(settings),
+    syncIntervalSec: cols.sync_interval_sec,
   });
 
   try {
     deviceEventManager.broadcast(deviceId, {
       type: 'SETTINGS_UPDATED',
       deviceId,
-      tenantSlug: tenantSlug || '',
+      tenantSlug: slug,
       settings: merged,
     });
   } catch {
@@ -1479,9 +1700,48 @@ export async function deviceSettingsUpsertHandler(req: FastifyRequest, reply: Fa
     ok: true,
     id,
     deviceId,
-    tenantSlug: tenantSlug || '',
+    tenantSlug: slug,
     settings: merged,
     updatedAt: now,
+  });
+}
+
+/** BI → Electron remote command: restart app or check for updates */
+const DeviceCommandSchema = z.object({
+  deviceId: z.string().min(1),
+  action: z.enum(['restart', 'check_update']),
+});
+
+export async function deviceCommandHandler(req: FastifyRequest, reply: FastifyReply) {
+  const parsed = DeviceCommandSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+
+  const db = getDb();
+  const { deviceId, action } = parsed.data;
+  const device = db.prepare(`SELECT id, status FROM devices WHERE id = ?`).get(deviceId) as any;
+  if (!device) return reply.code(404).send({ error: 'Device not found' });
+
+  const eventType = action === 'restart' ? 'DEVICE_RESTART' : 'DEVICE_CHECK_UPDATE';
+  let delivered = false;
+  try {
+    delivered = deviceEventManager.broadcast(deviceId, {
+      type: eventType as any,
+      deviceId,
+    });
+  } catch (e) {
+    console.warn('[deviceCommand] broadcast failed', e);
+  }
+
+  logSync('update', 'device', deviceId, 'bi_admin', { action: eventType, delivered });
+
+  return reply.send({
+    ok: true,
+    deviceId,
+    action,
+    delivered,
+    message: delivered
+      ? 'Electron-a buýruk ugradyldy'
+      : 'Enjam offline ýa-da device-events bagly däl — Electron açyk bolmaly',
   });
 }
 

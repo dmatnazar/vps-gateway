@@ -172,6 +172,8 @@ function applySchema(db: Database.Database) {
   migrateToV7(db);
   migrateToV8(db);
   migrateToV9(db);
+  migrateToV10(db);
+  migrateToV11(db);
 }
 
 /** v2: edit locks (is_open) on tenants / staff / endpoints */
@@ -667,6 +669,115 @@ function migrateToV9(db: Database.Database) {
     `INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (9, datetime('now'))`
   ).run();
   console.log('✅ schema v9: billing (tariffs, wallets, ledger)');
+}
+
+/**
+ * v10: device_app_settings — structured per-device Electron settings (columns, not only JSON blob).
+ * Also keeps device_settings.settings_json in sync for older clients.
+ */
+function migrateToV10(db: Database.Database) {
+  const ver = getSchemaVersion(db);
+  if (ver >= 10) return;
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS device_app_settings (
+      id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      tenant_slug TEXT NOT NULL DEFAULT '',
+      autostart INTEGER NOT NULL DEFAULT 0,
+      start_minimized INTEGER NOT NULL DEFAULT 0,
+      tray_minimize INTEGER NOT NULL DEFAULT 1,
+      auto_login INTEGER NOT NULL DEFAULT 0,
+      auto_sync INTEGER NOT NULL DEFAULT 1,
+      sync_interval_sec INTEGER NOT NULL DEFAULT 30,
+      offline_queue INTEGER NOT NULL DEFAULT 1,
+      notify_on_sync INTEGER NOT NULL DEFAULT 1,
+      auto_sign_out_min INTEGER NOT NULL DEFAULT 0,
+      theme TEXT NOT NULL DEFAULT 'dark',
+      language TEXT NOT NULL DEFAULT 'tk',
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_by TEXT DEFAULT '',
+      UNIQUE(device_id, tenant_slug)
+    );
+    CREATE INDEX IF NOT EXISTS idx_device_app_settings_device ON device_app_settings(device_id);
+    CREATE INDEX IF NOT EXISTS idx_device_app_settings_tenant ON device_app_settings(tenant_slug);
+  `);
+
+  // Migrate from legacy device_settings.settings_json
+  try {
+    const rows = db.prepare(`SELECT * FROM device_settings`).all() as any[];
+    const ins = db.prepare(`
+      INSERT OR REPLACE INTO device_app_settings (
+        id, device_id, tenant_slug,
+        autostart, start_minimized, tray_minimize, auto_login,
+        auto_sync, sync_interval_sec, offline_queue, notify_on_sync,
+        auto_sign_out_min, theme, language, updated_at, updated_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const r of rows) {
+      let s: Record<string, unknown> = {};
+      try {
+        s = JSON.parse(r.settings_json || '{}');
+      } catch {
+        s = {};
+      }
+      // Prefer explicit seconds; if only minutes were stored, convert
+      let sec = Number(s.syncIntervalSec ?? s.sync_interval_sec ?? 0);
+      if (!sec || sec <= 0) {
+        const min = Number(s.syncIntervalMin ?? s.sync_interval_min ?? 0);
+        sec = min > 0 ? Math.round(min * 60) : 30;
+      }
+      // Heuristic: values 1–14 that were meant as minutes → seconds
+      if (sec > 0 && sec <= 14 && s.syncIntervalSec == null && s.sync_interval_sec == null) {
+        sec = sec * 60;
+      }
+      ins.run(
+        r.id || `das_${r.device_id}`,
+        r.device_id,
+        r.tenant_slug || '',
+        s.autostart ? 1 : 0,
+        s.startMinimized || s.start_minimized ? 1 : 0,
+        s.trayMinimize === false || s.tray_minimize === false ? 0 : 1,
+        s.autoLogin || s.auto_login ? 1 : 0,
+        s.autoSync === false || s.auto_sync === false ? 0 : 1,
+        sec,
+        s.offlineQueue === false || s.offline_queue === false ? 0 : 1,
+        s.notifyOnSync === false || s.notify_on_sync === false ? 0 : 1,
+        Math.max(0, Number(s.autoSignOutMin ?? s.auto_sign_out_min ?? 0) || 0),
+        String(s.theme || 'dark'),
+        String(s.language || 'tk'),
+        r.updated_at || new Date().toISOString(),
+        r.updated_by || ''
+      );
+    }
+  } catch (e) {
+    console.warn('[migrate v10] device_settings import', e);
+  }
+
+  db.prepare(
+    `INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (10, datetime('now'))`
+  ).run();
+  console.log('✅ schema v10: device_app_settings (structured Electron settings)');
+}
+
+/** v11: auto_login_username on device_app_settings */
+function migrateToV11(db: Database.Database) {
+  const ver = getSchemaVersion(db);
+  if (ver >= 11) return;
+  try {
+    const cols = (db.prepare(`PRAGMA table_info(device_app_settings)`).all() as { name: string }[]).map(
+      (r) => r.name
+    );
+    if (!cols.includes('auto_login_username')) {
+      db.exec(`ALTER TABLE device_app_settings ADD COLUMN auto_login_username TEXT DEFAULT ''`);
+    }
+  } catch (e) {
+    console.warn('[migrate v11]', e);
+  }
+  db.prepare(
+    `INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (11, datetime('now'))`
+  ).run();
+  console.log('✅ schema v11: device_app_settings.auto_login_username');
 }
 
 

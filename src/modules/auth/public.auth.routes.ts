@@ -128,13 +128,13 @@ export async function publicAuthRoutes(app: FastifyInstance) {
   });
 }
 
-/** Public read — Electron DeviceGate / all clients pull update server settings */
+/** Public read — Electron pulls update feed + public gateway URL (from BI) on every sync */
 export async function registerClientConfigRoutes(app: FastifyInstance) {
   app.get('/api/client-config/update-feed', async (_req, reply) => {
     const raw = getAppSetting('update_feed');
     let cfg: Record<string, unknown> = {
-      protocol: 'https',
-      host: '',
+      protocol: 'http',
+      host: '216.250.13.39',
       port: '',
       path: '/updates',
       username: '',
@@ -146,7 +146,21 @@ export async function registerClientConfigRoutes(app: FastifyInstance) {
         /* ignore */
       }
     }
-    const { password: _p, ...safe } = cfg as any;
-    return reply.send({ ok: true, updateFeed: { ...safe, password: '' } });
+    // Electron auto-update Basic Auth — password must travel so BI changes apply on sync.
+    // This is the update-server credential (not user login).
+    const gatewayUrl = (getAppSetting('public_gateway_url') || '').trim();
+    return reply.send({
+      ok: true,
+      updateFeed: {
+        protocol: cfg.protocol || 'http',
+        host: cfg.host || '',
+        port: cfg.port ?? '',
+        path: cfg.path || '/updates',
+        username: cfg.username || '',
+        password: typeof cfg.password === 'string' ? cfg.password : '',
+      },
+      /** BI Settings-däki GATEWAY_URL — Electron şony ulanmaly */
+      gatewayUrl: gatewayUrl || '',
+    });
   });
 }

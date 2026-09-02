@@ -67,6 +67,8 @@ const SyncSchema = z.object({
         dbKey: z.string().optional(),
         connectionId: z.string().optional(),
         database: z.string().optional(),
+        /** Client last-write timestamp — LWW vs VPS endpoints.updated_at */
+        updatedAt: z.string().optional(),
       }).passthrough()
     )
     .optional()
@@ -153,16 +155,26 @@ export async function syncSchemaHandler(req: FastifyRequest, reply: FastifyReply
 
   invalidateTenantPool(tenantSlug);
 
+  // LWW merge into SQLite (skips when VPS/BI updated_at is newer)
   await tenantRepository.replaceEndpoints(tenant.id, endpoints as any);
 
-  routeRegistry.replaceTenantRoutes(
-    tenantSlug,
-    endpoints.map((e) => ({
-      ...e,
+  // Rebuild in-memory routes from DB — NOT from client payload —
+  // otherwise skipped LWW rows would still leave stale Electron SQL in the router.
+  try {
+    const allEps = await tenantRepository.listAllEndpoints();
+    const forTenant = allEps.filter((e) => e.tenantSlug === tenantSlug);
+    routeRegistry.replaceTenantRoutes(tenantSlug, forTenant as any);
+  } catch (err) {
+    console.warn('[sync-schema] routeRegistry refresh from DB failed', err);
+    routeRegistry.replaceTenantRoutes(
       tenantSlug,
-      dbKey: e.dbKey || 'primary',
-    })) as any
-  );
+      endpoints.map((e) => ({
+        ...e,
+        tenantSlug,
+        dbKey: e.dbKey || 'primary',
+      })) as any
+    );
+  }
 
   // Electron device that pushed schema → bind firm to that device (1 firm = 1 device)
   try {
