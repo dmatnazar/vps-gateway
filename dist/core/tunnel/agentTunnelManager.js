@@ -13,6 +13,10 @@ class AgentTunnelManager {
     /** Map of requestId -> PendingRequest */
     pendingRequests = new Map();
     pingInterval = null;
+    /** No PONG within this window → treat socket as dead (NAT / half-open) */
+    static PONG_TIMEOUT_MS = 55_000;
+    /** Application PING interval */
+    static PING_INTERVAL_MS = 15_000;
     constructor() {
         this.startHeartbeat();
     }
@@ -21,35 +25,54 @@ class AgentTunnelManager {
             clearInterval(this.pingInterval);
         this.pingInterval = setInterval(() => {
             const now = new Date();
-            for (const [tenantSlug, connSet] of this.agents.entries()) {
-                for (const conn of connSet) {
-                    if (conn.socket.readyState === 1 /* OPEN */) {
-                        try {
-                            conn.lastPingAt = now;
-                            conn.socket.send(JSON.stringify({ type: 'PING', timestamp: now.toISOString() }));
-                        }
-                        catch {
-                            this.removeConnection(conn);
+            const nowMs = now.getTime();
+            for (const [, connSet] of this.agents.entries()) {
+                // Copy to avoid mutation during iteration
+                for (const conn of Array.from(connSet)) {
+                    if (conn.socket.readyState !== 1 /* OPEN */) {
+                        this.removeConnection(conn);
+                        continue;
+                    }
+                    // Stale: no PONG for too long → force drop so Electron can reconnect
+                    const silentMs = nowMs - conn.lastPongAt.getTime();
+                    if (silentMs > AgentTunnelManager.PONG_TIMEOUT_MS) {
+                        console.warn(`[AgentTunnel] ⚠️ No PONG from "${conn.tenantSlug}" for ${Math.round(silentMs / 1000)}s — dropping zombie socket`);
+                        this.removeConnection(conn);
+                        continue;
+                    }
+                    try {
+                        conn.lastPingAt = now;
+                        conn.socket.send(JSON.stringify({ type: 'PING', timestamp: now.toISOString() }));
+                        // TCP-level ping when supported (ws library)
+                        const sock = conn.socket;
+                        if (typeof sock.ping === 'function') {
+                            try {
+                                sock.ping();
+                            }
+                            catch {
+                                /* ignore */
+                            }
                         }
                     }
-                    else {
+                    catch {
                         this.removeConnection(conn);
                     }
                 }
             }
-        }, 20_000);
+        }, AgentTunnelManager.PING_INTERVAL_MS);
     }
     /**
      * Register a newly connected agent WebSocket
      */
     registerAgent(tenantSlug, socket, clientInfo) {
+        const now = new Date();
         const conn = {
             socket,
             tenantSlug,
             clientInfo,
-            connectedAt: new Date(),
-            lastPingAt: new Date(),
-            lastPongAt: new Date(),
+            connectedAt: now,
+            lastPingAt: now,
+            lastPongAt: now,
         };
         if (!this.agents.has(tenantSlug)) {
             this.agents.set(tenantSlug, new Set());
@@ -65,6 +88,10 @@ class AgentTunnelManager {
         socket.on('error', (err) => {
             console.warn(`[AgentTunnel] socket error (${tenantSlug}):`, err?.message || err);
             this.removeConnection(conn);
+        });
+        // TCP pong from ws library also counts as liveness
+        socket.on('pong', () => {
+            conn.lastPongAt = new Date();
         });
         console.log(`[AgentTunnel] 🟢 Agent connected for tenant "${tenantSlug}" (${clientInfo || 'Electron'})`);
         return conn;

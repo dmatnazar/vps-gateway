@@ -69,6 +69,8 @@ async function adminRoutes(app) {
     app.get('/api/admin/device-settings', { preHandler: [app.verifyAdminSyncSignature] }, hub_controller_1.deviceSettingsGetHandler);
     app.put('/api/admin/device-settings', { preHandler: [app.verifyAdminSyncSignature] }, hub_controller_1.deviceSettingsUpsertHandler);
     app.post('/api/admin/device-settings', { preHandler: [app.verifyAdminSyncSignature] }, hub_controller_1.deviceSettingsUpsertHandler);
+    // Remote commands: restart Electron / check update
+    app.post('/api/admin/device-command', { preHandler: [app.verifyAdminSyncSignature] }, hub_controller_1.deviceCommandHandler);
     // Electron device can also push/pull own settings
     app.get('/api/admin/device-settings/self', { preHandler: [app.verifySyncSignature] }, hub_controller_1.deviceSettingsGetHandler);
     app.put('/api/admin/device-settings/self', { preHandler: [app.verifySyncSignature] }, hub_controller_1.deviceSettingsUpsertHandler);
@@ -140,10 +142,17 @@ async function adminRoutes(app) {
         catch {
             prev = {};
         }
+        // port: explicit empty string means "default (omit from URL)" — do not fall back to prev 443
+        const portRaw = body.port;
+        const portNext = portRaw === undefined
+            ? prev.port || ''
+            : String(portRaw).trim() === ''
+                ? ''
+                : String(portRaw).trim();
         const next = {
             protocol: body.protocol === 'http' ? 'http' : 'https',
             host: String(body.host || prev.host || '').trim(),
-            port: body.port !== undefined && body.port !== '' ? String(body.port) : prev.port || '',
+            port: portNext,
             path: String(body.path || prev.path || '/updates'),
             username: String(body.username ?? prev.username ?? ''),
             password: body.password !== undefined && String(body.password).length > 0
@@ -154,6 +163,22 @@ async function adminRoutes(app) {
         return reply.send({
             ok: true,
             updateFeed: { ...next, password: next.password ? '••••' : '' },
+        });
+    });
+    // BI publishes its GATEWAY_URL so Electrons can adopt it on sync
+    app.put('/api/admin/client-config/gateway-url', { preHandler: [app.verifyAdminSyncSignature] }, async (req, reply) => {
+        const { setAppSetting, getAppSetting } = await Promise.resolve().then(() => __importStar(require('../../store/sqliteDb')));
+        const body = (req.body || {});
+        const url = String(body.gatewayUrl || '')
+            .trim()
+            .replace(/\/$/, '');
+        if (!url) {
+            return reply.code(400).send({ error: 'gatewayUrl required' });
+        }
+        setAppSetting('public_gateway_url', url);
+        return reply.send({
+            ok: true,
+            gatewayUrl: getAppSetting('public_gateway_url') || url,
         });
     });
 }

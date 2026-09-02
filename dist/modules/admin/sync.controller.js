@@ -41,15 +41,30 @@ const connectionPoolManager_1 = require("../../core/db/connectionPoolManager");
 const crypto_1 = require("../../core/db/crypto");
 const sqliteDb_1 = require("../../store/sqliteDb");
 const ParamDefSchema = zod_1.z.object({
-    name: zod_1.z.string(),
-    sqlParam: zod_1.z.string(),
-    type: zod_1.z.enum(['int', 'bigint', 'date', 'datetime', 'nvarchar', 'bit', 'float']),
-    required: zod_1.z.boolean(),
+    name: zod_1.z.string().min(1),
+    sqlParam: zod_1.z.string().optional().default(''),
+    type: zod_1.z
+        .string()
+        .optional()
+        .transform((t) => {
+        const allowed = ['int', 'bigint', 'date', 'datetime', 'nvarchar', 'bit', 'float'];
+        const v = (t || 'nvarchar').toLowerCase();
+        return (allowed.includes(v) ? v : 'nvarchar');
+    }),
+    required: zod_1.z.boolean().optional().default(false),
     default: zod_1.z.any().optional(),
-});
+}).passthrough();
+const ParamsSchemaLoose = zod_1.z
+    .object({
+    urlParams: zod_1.z.array(ParamDefSchema).optional().default([]),
+    queryParams: zod_1.z.array(ParamDefSchema).optional().default([]),
+    bodyParams: zod_1.z.array(ParamDefSchema).optional().default([]),
+})
+    .optional()
+    .default({ urlParams: [], queryParams: [], bodyParams: [] });
 const SyncSchema = zod_1.z.object({
     tenantSlug: zod_1.z.string().min(1),
-    tenantName: zod_1.z.string(),
+    tenantName: zod_1.z.string().optional().default(''),
     dbConnectionString: zod_1.z.string().optional(),
     connections: zod_1.z
         .array(zod_1.z.object({
@@ -60,25 +75,48 @@ const SyncSchema = zod_1.z.object({
         isPrimary: zod_1.z.boolean().optional(),
     }))
         .optional(),
-    endpoints: zod_1.z.array(zod_1.z.object({
-        name: zod_1.z.string(),
-        method: zod_1.z.enum(['GET', 'POST', 'PUT', 'DELETE']),
-        pathTemplate: zod_1.z.string(),
-        sqlQuery: zod_1.z.string(),
-        paramsSchema: zod_1.z.object({
-            urlParams: zod_1.z.array(ParamDefSchema),
-            queryParams: zod_1.z.array(ParamDefSchema),
-            bodyParams: zod_1.z.array(ParamDefSchema),
+    endpoints: zod_1.z
+        .array(zod_1.z.object({
+        id: zod_1.z.string().optional(),
+        name: zod_1.z.string().optional().default('endpoint'),
+        method: zod_1.z
+            .string()
+            .optional()
+            .transform((m) => {
+            const u = String(m || 'GET').toUpperCase();
+            if (['GET', 'POST', 'PUT', 'DELETE', 'PATCH'].includes(u))
+                return u === 'PATCH' ? 'PUT' : u;
+            return 'GET';
         }),
+        pathTemplate: zod_1.z.string().optional().default('/'),
+        sqlQuery: zod_1.z.string().optional().default('SELECT 1'),
+        paramsSchema: ParamsSchemaLoose,
         responseSchema: zod_1.z.any().optional(),
-        cacheTtlSec: zod_1.z.number().default(0),
-        authRequired: zod_1.z.boolean().default(true),
+        cacheTtlSec: zod_1.z.coerce.number().optional().default(0),
+        authRequired: zod_1.z.boolean().optional().default(true),
         dbKey: zod_1.z.string().optional(),
         connectionId: zod_1.z.string().optional(),
         database: zod_1.z.string().optional(),
-    })),
+        /** Client last-write timestamp — LWW vs VPS endpoints.updated_at */
+        updatedAt: zod_1.z.string().optional(),
+    }).passthrough())
+        .optional()
+        .default([]),
 });
 async function syncSchemaHandler(req, reply) {
+    // Electron sync → refresh device online status
+    try {
+        const h = req.headers;
+        const deviceId = h['x-device-id'] || '';
+        if (deviceId) {
+            (0, sqliteDb_1.getDb)()
+                .prepare(`UPDATE devices SET last_seen_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`)
+                .run(deviceId);
+        }
+    }
+    catch {
+        /* */
+    }
     const parsed = SyncSchema.safeParse(req.body);
     if (!parsed.success) {
         return reply.code(400).send({ error: parsed.error.flatten() });
@@ -87,12 +125,31 @@ async function syncSchemaHandler(req, reply) {
     let tenant = await tenant_repository_1.tenantRepository.findBySlug(tenantSlug);
     const encryptedConnections = connections?.map((c) => {
         const { enc, iv } = (0, crypto_1.encryptConnString)(c.connectionString);
+        let host = '';
+        let port = 1433;
+        let username = '';
+        try {
+            const { parseConnectionString } = require('../../core/db/connectionPoolManager');
+            const p = parseConnectionString(c.connectionString);
+            host = p.server || '';
+            port = p.port || 1433;
+            username = p.user || '';
+        }
+        catch {
+            /* */
+        }
         return {
             dbKey: c.dbKey,
             label: c.label || c.dbKey,
             database: c.database,
             dbConnEnc: enc,
             dbConnIv: iv,
+            isPrimary: Boolean(c.isPrimary),
+            host,
+            port,
+            username,
+            encrypt: true,
+            trustServerCertificate: true,
         };
     }) ?? undefined;
     const primaryConnString = dbConnectionString ||
@@ -118,26 +175,49 @@ async function syncSchemaHandler(req, reply) {
         await tenant_repository_1.tenantRepository.replaceConnections(tenant.id, encryptedConnections);
     }
     (0, connectionPoolManager_1.invalidateTenantPool)(tenantSlug);
+    // LWW merge into SQLite (skips when VPS/BI updated_at is newer)
     await tenant_repository_1.tenantRepository.replaceEndpoints(tenant.id, endpoints);
-    routeRegistry_1.routeRegistry.replaceTenantRoutes(tenantSlug, endpoints.map((e) => ({
-        ...e,
-        tenantSlug,
-        dbKey: e.dbKey || 'primary',
-    })));
-    // Electron device that pushed schema → auto-bind firm to that device
+    // Rebuild in-memory routes from DB — NOT from client payload —
+    // otherwise skipped LWW rows would still leave stale Electron SQL in the router.
+    try {
+        const allEps = await tenant_repository_1.tenantRepository.listAllEndpoints();
+        const forTenant = allEps.filter((e) => e.tenantSlug === tenantSlug);
+        routeRegistry_1.routeRegistry.replaceTenantRoutes(tenantSlug, forTenant);
+    }
+    catch (err) {
+        console.warn('[sync-schema] routeRegistry refresh from DB failed', err);
+        routeRegistry_1.routeRegistry.replaceTenantRoutes(tenantSlug, endpoints.map((e) => ({
+            ...e,
+            tenantSlug,
+            dbKey: e.dbKey || 'primary',
+        })));
+    }
+    // Electron device that pushed schema → bind firm to that device (1 firm = 1 device)
     try {
         const deviceId = req.headers['x-device-id'] || '';
         if (deviceId) {
             const db = (await Promise.resolve().then(() => __importStar(require('../../store/sqliteDb')))).getDb();
             const { randomUUID } = await Promise.resolve().then(() => __importStar(require('crypto')));
+            const other = db
+                .prepare(`SELECT device_id FROM device_assignments WHERE tenant_slug = ? AND device_id != ? LIMIT 1`)
+                .get(tenantSlug, deviceId);
+            if (other?.device_id) {
+                return reply.code(409).send({
+                    error: `Firma "${tenantSlug}" eýýäm başga enjama bagly. Bir firma diňe bir enjama baglanyp bilýär.`,
+                    code: 'FIRM_ALREADY_ASSIGNED',
+                    deviceId: other.device_id,
+                    tenantSlug,
+                });
+            }
             const exists = db
                 .prepare(`SELECT id FROM device_assignments WHERE device_id = ? AND tenant_slug = ?`)
                 .get(deviceId, tenantSlug);
+            const nowA = new Date().toISOString();
             if (!exists) {
-                const nowA = new Date().toISOString();
                 db.prepare(`INSERT INTO device_assignments (id, device_id, tenant_slug, endpoint_id, description, created_at, updated_at)
            VALUES (?, ?, ?, NULL, 'auto-sync-schema', ?, ?)`).run(randomUUID(), deviceId, tenantSlug, nowA, nowA);
             }
+            db.prepare(`UPDATE devices SET last_seen_at = ?, updated_at = ? WHERE id = ?`).run(nowA, nowA, deviceId);
         }
     }
     catch (e) {

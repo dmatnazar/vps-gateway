@@ -121,13 +121,13 @@ async function publicAuthRoutes(app) {
         });
     });
 }
-/** Public read — Electron DeviceGate / all clients pull update server settings */
+/** Public read — Electron pulls update feed + public gateway URL (from BI) on every sync */
 async function registerClientConfigRoutes(app) {
     app.get('/api/client-config/update-feed', async (_req, reply) => {
         const raw = (0, sqliteDb_1.getAppSetting)('update_feed');
         let cfg = {
-            protocol: 'https',
-            host: '',
+            protocol: 'http',
+            host: '216.250.13.39',
             port: '',
             path: '/updates',
             username: '',
@@ -140,8 +140,22 @@ async function registerClientConfigRoutes(app) {
                 /* ignore */
             }
         }
-        const { password: _p, ...safe } = cfg;
-        return reply.send({ ok: true, updateFeed: { ...safe, password: '' } });
+        // Electron auto-update Basic Auth — password must travel so BI changes apply on sync.
+        // This is the update-server credential (not user login).
+        const gatewayUrl = ((0, sqliteDb_1.getAppSetting)('public_gateway_url') || '').trim();
+        return reply.send({
+            ok: true,
+            updateFeed: {
+                protocol: cfg.protocol || 'http',
+                host: cfg.host || '',
+                port: cfg.port ?? '',
+                path: cfg.path || '/updates',
+                username: cfg.username || '',
+                password: typeof cfg.password === 'string' ? cfg.password : '',
+            },
+            /** BI Settings-däki GATEWAY_URL — Electron şony ulanmaly */
+            gatewayUrl: gatewayUrl || '',
+        });
     });
 }
 //# sourceMappingURL=public.auth.routes.js.map

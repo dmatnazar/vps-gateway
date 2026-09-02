@@ -1417,6 +1417,7 @@ function normalizeDeviceAppPatch(
     start_minimized: number;
     tray_minimize: number;
     auto_login: number;
+    auto_login_username: string;
     auto_sync: number;
     sync_interval_sec: number;
     offline_queue: number;
@@ -1607,10 +1608,10 @@ export async function deviceSettingsUpsertHandler(req: FastifyRequest, reply: Fa
 
   // Ensure auto_login_username column exists (older DBs may miss v11)
   try {
-    const cols = (db.prepare(`PRAGMA table_info(device_app_settings)`).all() as { name: string }[]).map(
-      (c) => c.name
-    );
-    if (!cols.includes('auto_login_username')) {
+    const tableCols = (
+      db.prepare(`PRAGMA table_info(device_app_settings)`).all() as { name: string }[]
+    ).map((c) => c.name);
+    if (!tableCols.includes('auto_login_username')) {
       db.exec(`ALTER TABLE device_app_settings ADD COLUMN auto_login_username TEXT DEFAULT ''`);
     }
   } catch {
