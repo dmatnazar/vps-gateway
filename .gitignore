@@ -1,10 +1,12 @@
+# runtime data — never commit
+/data/
+data/
+!data/.gitkeep
+
 node_modules/
 .env
+.env.*
 *.log
-vps-gateway.zip
-vps-gateway.rar
-/data
-data/gateway.db
-data/gateway.db-shm
-data/gateway.db-wal
-data/*.db*
+*.db
+*.db-shm
+*.db-wal
