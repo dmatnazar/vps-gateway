@@ -154,7 +154,7 @@ export async function catalogHandler(req: FastifyRequest, reply: FastifyReply) {
       isActive: Boolean(t.is_active),
       connections,
       connectionCount: connections.length,
-      staffCount: (staffCountStmt.get(t.slug) as { c: number })?.c ?? 0,
+      staffCount: (staffCountStmt.get(t.slug, t.slug) as { c: number })?.c ?? 0,
       endpointCount: (epCountStmt.get(t.slug) as { c: number })?.c ?? 0,
       deviceCount: (deviceCountStmt.get(t.slug, t.slug) as { c: number })?.c ?? 0,
       billing,
@@ -607,6 +607,18 @@ export async function staffLookupHandler(req: FastifyRequest, reply: FastifyRepl
     hash.startsWith('pending-reset') ||
     hash.endsWith(':0000');
 
+  const userTenantSlugs: string[] = (() => {
+    try {
+      const parsed = JSON.parse(user.tenant_slugs || '[]');
+      return Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+    } catch { return []; }
+  })();
+  const userTenantIds = userTenantSlugs
+    .map((slug) => tenantRepository.findBySlug(slug))
+    .map(async (p) => (await p)?.id)
+    ;
+  const resolvedTenantIds = (await Promise.all(userTenantIds)).filter(Boolean);
+
   return reply.send({
     id: user.id,
     username: user.username,
@@ -615,7 +627,8 @@ export async function staffLookupHandler(req: FastifyRequest, reply: FastifyRepl
     passwordUsable: !isPlaceholder,
     role: user.role,
     tenantSlug: user.tenant_slug,
-    tenantSlugs: JSON.parse(user.tenant_slugs || '[]'),
+    tenantSlugs: userTenantSlugs,
+    tenantIds: resolvedTenantIds,
     tenantName: tenant?.name,
     tenantId: tenant?.id,
     phone: user.phone,
