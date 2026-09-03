@@ -302,6 +302,11 @@ function ensureDeviceAssignment(db: any, deviceId: string | undefined, tenantSlu
     if (exists) return { ok: true };
     const now = new Date().toISOString();
     const { randomUUID } = require('crypto');
+    // Defensive: drop any stale same-slug rows (should be none after v12 unique index)
+    db.prepare(`DELETE FROM device_assignments WHERE tenant_slug = ? AND device_id != ?`).run(
+      tenantSlug,
+      deviceId
+    );
     db.prepare(
       `INSERT INTO device_assignments (id, device_id, tenant_slug, endpoint_id, description, created_at, updated_at)
        VALUES (?, ?, ?, NULL, 'auto-from-electron', ?, ?)`
@@ -314,6 +319,39 @@ function ensureDeviceAssignment(db: any, deviceId: string | undefined, tenantSlu
     console.warn('[ensureDeviceAssignment]', e);
     return { ok: false, error: String(e) };
   }
+}
+
+/** Admin explicitly assigns firms to a device: move firm off any other device (intentional transfer). */
+function claimTenantAssignments(
+  db: any,
+  deviceId: string,
+  tenantSlugs: string[],
+  description = 'admin-assign'
+): void {
+  if (!deviceId || !tenantSlugs.length) return;
+  const now = new Date().toISOString();
+  const { randomUUID } = require('crypto');
+  const insert = db.prepare(
+    `INSERT INTO device_assignments (id, device_id, tenant_slug, endpoint_id, description, created_at, updated_at)
+     VALUES (?, ?, ?, NULL, ?, ?, ?)`
+  );
+  const delOther = db.prepare(
+    `DELETE FROM device_assignments WHERE tenant_slug = ? AND device_id != ?`
+  );
+  const hasPair = db.prepare(
+    `SELECT id FROM device_assignments WHERE device_id = ? AND tenant_slug = ?`
+  );
+  const tx = db.transaction(() => {
+    for (const slug of tenantSlugs) {
+      if (!slug) continue;
+      // 1 firm = 1 device: release firm from any other device first
+      delOther.run(slug, deviceId);
+      if (!hasPair.get(deviceId, slug)) {
+        insert.run(randomUUID(), deviceId, slug, description, now, now);
+      }
+    }
+  });
+  tx();
 }
 
 
@@ -332,9 +370,16 @@ export async function createTenantHandler(req: FastifyRequest, reply: FastifyRep
 
   const existing = db.prepare(`SELECT id FROM tenants WHERE slug = ?`).get(slug) as any;
   if (existing) {
-    // Already exists — still auto-assign calling Electron device
-    ensureDeviceAssignment(db, deviceId, slug);
-    return reply.code(409).send({ error: `Tenant "${slug}" already exists`, tenantId: existing.id, assigned: true });
+    // Already exists — try auto-assign; surface firm-already-on-other-device clearly
+    const assign = ensureDeviceAssignment(db, deviceId, slug);
+    if (!assign.ok && assign.error) {
+      return reply.code(409).send({
+        error: assign.error,
+        code: 'FIRM_ALREADY_ASSIGNED',
+        tenantId: existing.id,
+      });
+    }
+    return reply.code(409).send({ error: `Tenant "${slug}" already exists`, tenantId: existing.id, assigned: Boolean(deviceId) });
   }
 
   const now = new Date().toISOString();
@@ -345,7 +390,15 @@ export async function createTenantHandler(req: FastifyRequest, reply: FastifyRep
     VALUES (?, ?, ?, 1, ?, ?)
   `).run(id, slug, name, now, now);
 
-  ensureDeviceAssignment(db, deviceId, slug);
+  const assign = ensureDeviceAssignment(db, deviceId, slug);
+  if (!assign.ok && assign.error) {
+    // Tenant created but firm locked to another device — still report conflict
+    return reply.code(409).send({
+      error: assign.error,
+      code: 'FIRM_ALREADY_ASSIGNED',
+      tenantId: id,
+    });
+  }
 
   logSync('create', 'tenant', id, deviceId ? 'api' : 'bi_admin', { slug, name, deviceId });
 
@@ -2430,16 +2483,13 @@ export async function approveDeviceHandler(req: FastifyRequest, reply: FastifyRe
     WHERE id = ?
   `).run(...setParams, params.id);
 
-  const now = new Date().toISOString();
-  const insertAssignment = db.prepare(`
-    INSERT INTO device_assignments (id, device_id, tenant_slug, endpoint_id, description, created_at, updated_at)
-    VALUES (?, ?, ?, NULL, '', ?, ?)
-  `);
-
-  for (const tenant of tenants) {
-    const assignmentId = randomId();
-    insertAssignment.run(assignmentId, params.id, tenant.slug, now, now);
-  }
+  // 1 firm = 1 device: claim firms (removes them from any other device — admin transfer)
+  claimTenantAssignments(
+    db,
+    params.id,
+    tenants.map((t: any) => t.slug),
+    'admin-approve'
+  );
 
   logSync('approve', 'device', params.id, 'bi_admin', { tenantSlugs: tenants.map((t) => t.slug) });
 
@@ -2508,19 +2558,8 @@ export async function updateDeviceStatusHandler(req: FastifyRequest, reply: Fast
   }
 
   if (body.status === 'approved' && tenantSlugs.length > 0) {
-    const existingSlugs = db.prepare(`SELECT tenant_slug FROM device_assignments WHERE device_id = ?`).all(params.id) as any[];
-    const existingSet = new Set(existingSlugs.map((r) => r.tenant_slug));
-    const newSlugs = tenantSlugs.filter((s) => !existingSet.has(s));
-    if (newSlugs.length > 0) {
-      const now = new Date().toISOString();
-      const insertAssignment = db.prepare(`
-        INSERT INTO device_assignments (id, device_id, tenant_slug, endpoint_id, description, created_at, updated_at)
-        VALUES (?, ?, ?, NULL, '', ?, ?)
-      `);
-      for (const slug of newSlugs) {
-        insertAssignment.run(randomId(), params.id, slug, now, now);
-      }
-    }
+    // 1 firm = 1 device: claim (transfer off other devices) + ensure this device has rows
+    claimTenantAssignments(db, params.id, tenantSlugs, 'admin-update');
   }
 
   db.prepare(`
