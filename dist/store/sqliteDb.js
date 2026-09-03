@@ -23,7 +23,7 @@ const better_sqlite3_1 = __importDefault(require("better-sqlite3"));
 const node_path_1 = __importDefault(require("node:path"));
 const node_fs_1 = __importDefault(require("node:fs"));
 const env_1 = require("../config/env");
-const CURRENT_SCHEMA_VERSION = 4;
+const CURRENT_SCHEMA_VERSION = 12;
 // Resolve DB path: same directory as the old JSON, but .sqlite extension
 const dbDir = node_path_1.default.dirname(node_path_1.default.resolve(env_1.env.DB_FILE));
 if (!node_fs_1.default.existsSync(dbDir))
@@ -174,6 +174,7 @@ function applySchema(db) {
     migrateToV9(db);
     migrateToV10(db);
     migrateToV11(db);
+    migrateToV12(db);
 }
 /** v2: edit locks (is_open) on tenants / staff / endpoints */
 function migrateToV2(db) {
@@ -687,6 +688,67 @@ function migrateToV11(db) {
     }
     db.prepare(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (11, datetime('now'))`).run();
     console.log('✅ schema v11: device_app_settings.auto_login_username');
+}
+/** v12: 1 firm = 1 device — dedupe device_assignments + UNIQUE(tenant_slug) */
+function migrateToV12(db) {
+    const ver = getSchemaVersion(db);
+    if (ver >= 12)
+        return;
+    try {
+        // Keep newest assignment per tenant_slug; drop older duplicates that caused FIRM_ALREADY_ASSIGNED
+        db.exec(`
+      DELETE FROM device_assignments
+      WHERE id NOT IN (
+        SELECT id FROM (
+          SELECT id,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY tenant_slug
+                   ORDER BY datetime(COALESCE(updated_at, created_at)) DESC, rowid DESC
+                 ) AS rn
+          FROM device_assignments
+        ) ranked
+        WHERE rn = 1
+      );
+    `);
+    }
+    catch (e) {
+        // SQLite without window functions (very old) — fallback: keep max(created_at) per slug
+        console.warn('[migrate v12] window dedupe failed, using fallback', e);
+        try {
+            const rows = db
+                .prepare(`SELECT tenant_slug, id, created_at, updated_at FROM device_assignments ORDER BY tenant_slug, datetime(COALESCE(updated_at, created_at)) DESC`)
+                .all();
+            const seen = new Set();
+            const del = db.prepare(`DELETE FROM device_assignments WHERE id = ?`);
+            const tx = db.transaction(() => {
+                for (const r of rows) {
+                    if (seen.has(r.tenant_slug))
+                        del.run(r.id);
+                    else
+                        seen.add(r.tenant_slug);
+                }
+            });
+            tx();
+        }
+        catch (e2) {
+            console.warn('[migrate v12] fallback dedupe failed', e2);
+        }
+    }
+    try {
+        db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_device_assignments_tenant_unique ON device_assignments(tenant_slug)`);
+    }
+    catch (e) {
+        console.warn('[migrate v12] unique index failed (duplicates remain?)', e);
+    }
+    // Also prevent same device+tenant double rows
+    try {
+        db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_device_assignments_device_tenant ON device_assignments(device_id, tenant_slug)`);
+    }
+    catch (e) {
+        console.warn('[migrate v12] device+tenant unique index failed', e);
+    }
+    db.prepare(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (12, datetime('now'))`).run();
+    console.log('✅ schema v12: device_assignments 1-firm-1-device unique + dedupe');
 }
 // ---------------------------------------------------------------------------
 // Audit / Sync Log Helper

@@ -193,8 +193,11 @@ async function syncSchemaHandler(req, reply) {
         })));
     }
     // Electron device that pushed schema → bind firm to that device (1 firm = 1 device)
+    // Automatic reassignment is NOT allowed here — only BI Admin approve/update may transfer a firm.
     try {
-        const deviceId = req.headers['x-device-id'] || '';
+        const deviceId = req.headers['x-device-id'] ||
+            req.headers['X-Device-Id'] ||
+            '';
         if (deviceId) {
             const db = (await Promise.resolve().then(() => __importStar(require('../../store/sqliteDb')))).getDb();
             const { randomUUID } = await Promise.resolve().then(() => __importStar(require('crypto')));
@@ -214,8 +217,25 @@ async function syncSchemaHandler(req, reply) {
                 .get(deviceId, tenantSlug);
             const nowA = new Date().toISOString();
             if (!exists) {
-                db.prepare(`INSERT INTO device_assignments (id, device_id, tenant_slug, endpoint_id, description, created_at, updated_at)
-           VALUES (?, ?, ?, NULL, 'auto-sync-schema', ?, ?)`).run(randomUUID(), deviceId, tenantSlug, nowA, nowA);
+                try {
+                    db.prepare(`INSERT INTO device_assignments (id, device_id, tenant_slug, endpoint_id, description, created_at, updated_at)
+             VALUES (?, ?, ?, NULL, 'auto-sync-schema', ?, ?)`).run(randomUUID(), deviceId, tenantSlug, nowA, nowA);
+                }
+                catch (insErr) {
+                    // Unique index race: another device claimed the firm between SELECT and INSERT
+                    const again = db
+                        .prepare(`SELECT device_id FROM device_assignments WHERE tenant_slug = ? AND device_id != ? LIMIT 1`)
+                        .get(tenantSlug, deviceId);
+                    if (again?.device_id) {
+                        return reply.code(409).send({
+                            error: `Firma "${tenantSlug}" eýýäm başga enjama bagly. Bir firma diňe bir enjama baglanyp bilýär.`,
+                            code: 'FIRM_ALREADY_ASSIGNED',
+                            deviceId: again.device_id,
+                            tenantSlug,
+                        });
+                    }
+                    throw insErr;
+                }
             }
             db.prepare(`UPDATE devices SET last_seen_at = ?, updated_at = ? WHERE id = ?`).run(nowA, nowA, deviceId);
         }
