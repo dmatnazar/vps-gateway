@@ -227,10 +227,38 @@ export async function tariffUpsertHandler(req: FastifyRequest, reply: FastifyRep
   return reply.send({ ok: true, tariff: mapTariff(row) });
 }
 
+const ActorFields = {
+  createdBy: z.string().optional(),
+  username: z.string().optional(),
+  actor: z.string().optional(),
+  deviceName: z.string().optional(),
+  source: z.string().optional(),
+};
+
+function resolveActor(body: {
+  createdBy?: string;
+  username?: string;
+  actor?: string;
+  deviceName?: string;
+  source?: string;
+}): { createdBy: string; deviceName: string } {
+  const createdBy =
+    (body.createdBy && body.createdBy.trim()) ||
+    (body.actor && body.actor.trim()) ||
+    (body.username && body.username.trim()) ||
+    'bi_admin';
+  const deviceName =
+    (body.deviceName && body.deviceName.trim()) ||
+    (body.source === 'web' ? 'Web admin' : '') ||
+    '';
+  return { createdBy, deviceName };
+}
+
 const AssignSchema = z.object({
   tenantSlug: z.string().min(1),
   tariffId: z.string().min(1),
   grantIncludedCredits: z.boolean().optional(),
+  ...ActorFields,
 });
 
 /** POST /api/admin/billing/assign-tariff */
@@ -246,6 +274,7 @@ export async function assignTariffHandler(req: FastifyRequest, reply: FastifyRep
 
   const now = new Date().toISOString();
   const periodEnd = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
+  const actor = resolveActor(parsed.data);
 
   db.prepare(
     `INSERT INTO tenant_subscriptions (tenant_id, tenant_slug, tariff_id, status, period_start, period_end, auto_renew, updated_at)
@@ -265,7 +294,8 @@ export async function assignTariffHandler(req: FastifyRequest, reply: FastifyRep
       type: 'grant',
       amount: Number(tariff.included_credits),
       reason: `Tarif «${tariff.name}» — aýlyk kredit`,
-      createdBy: 'bi_admin',
+      createdBy: actor.createdBy,
+      deviceName: actor.deviceName,
     });
   }
 
@@ -273,6 +303,7 @@ export async function assignTariffHandler(req: FastifyRequest, reply: FastifyRep
     tariffId: tariff.id,
     code: tariff.code,
     granted,
+    by: actor.createdBy,
   });
 
   const w = db.prepare(`SELECT * FROM tenant_wallets WHERE tenant_id = ?`).get(tenant.id);
@@ -288,6 +319,7 @@ const TopUpSchema = z.object({
   tenantSlug: z.string().min(1),
   amount: z.number().positive(),
   reason: z.string().optional(),
+  ...ActorFields,
 });
 
 /** POST /api/admin/billing/topup */
@@ -299,6 +331,7 @@ export async function topUpHandler(req: FastifyRequest, reply: FastifyReply) {
   const tenant = db.prepare(`SELECT * FROM tenants WHERE slug = ?`).get(parsed.data.tenantSlug) as any;
   if (!tenant) return reply.code(404).send({ error: 'Firma tapylmady' });
 
+  const actor = resolveActor(parsed.data);
   ensureWallet(db, tenant.id, tenant.slug, 0);
   const balanceAfter = await applyLedger(db, {
     tenantId: tenant.id,
@@ -306,12 +339,14 @@ export async function topUpHandler(req: FastifyRequest, reply: FastifyReply) {
     type: 'topup',
     amount: parsed.data.amount,
     reason: parsed.data.reason || 'Admin top-up',
-    createdBy: 'bi_admin',
+    createdBy: actor.createdBy,
+    deviceName: actor.deviceName,
   });
 
   logSync('update', 'wallet', tenant.id, 'bi_admin', {
     amount: parsed.data.amount,
     balanceAfter,
+    by: actor.createdBy,
   });
 
   const w = db.prepare(`SELECT * FROM tenant_wallets WHERE tenant_id = ?`).get(tenant.id);
@@ -331,6 +366,7 @@ const AdjustSchema = z.object({
   tenantSlug: z.string().min(1),
   amount: z.number(), // can be negative
   reason: z.string().min(1),
+  ...ActorFields,
 });
 
 /** POST /api/admin/billing/adjust — manual +/- with reason */
@@ -342,6 +378,7 @@ export async function adjustBalanceHandler(req: FastifyRequest, reply: FastifyRe
   const tenant = db.prepare(`SELECT * FROM tenants WHERE slug = ?`).get(parsed.data.tenantSlug) as any;
   if (!tenant) return reply.code(404).send({ error: 'Firma tapylmady' });
 
+  const actor = resolveActor(parsed.data);
   ensureWallet(db, tenant.id, tenant.slug, 0);
   const type = parsed.data.amount >= 0 ? 'grant' : 'adjust';
   const balanceAfter = await applyLedger(db, {
@@ -350,7 +387,8 @@ export async function adjustBalanceHandler(req: FastifyRequest, reply: FastifyRe
     type,
     amount: parsed.data.amount,
     reason: parsed.data.reason,
-    createdBy: 'bi_admin',
+    createdBy: actor.createdBy,
+    deviceName: actor.deviceName,
   });
 
   const w = db.prepare(`SELECT * FROM tenant_wallets WHERE tenant_id = ?`).get(tenant.id);
@@ -374,20 +412,57 @@ export async function ledgerHandler(req: FastifyRequest, reply: FastifyReply) {
       .prepare(`SELECT * FROM wallet_ledger ORDER BY created_at DESC LIMIT ?`)
       .all(limit) as any[];
   }
+  // Resolve staff_id → human name when created_by looks like an id
+  const staffNameById = new Map<string, string>();
+  try {
+    const staffRows = db
+      .prepare(`SELECT id, username, full_name FROM staff`)
+      .all() as { id: string; username: string; full_name: string }[];
+    for (const s of staffRows) {
+      const label = (s.full_name && s.full_name.trim()) || (s.username && s.username.trim()) || '';
+      if (s.id && label) staffNameById.set(s.id, label);
+      if (s.username && label) staffNameById.set(s.username, label);
+    }
+  } catch {
+    /* */
+  }
+
   return reply.send({
-    entries: rows.map((r) => ({
-      id: r.id,
-      tenantId: r.tenant_id,
-      tenantSlug: r.tenant_slug,
-      staffId: r.staff_id,
-      type: r.type,
-      amount: Number(r.amount),
-      balanceAfter: Number(r.balance_after),
-      reason: r.reason,
-      refId: r.ref_id,
-      createdBy: r.created_by,
-      createdAt: r.created_at,
-    })),
+    entries: rows.map((r) => {
+      let createdBy = r.created_by || '';
+      let username = createdBy;
+      if (r.staff_id && staffNameById.has(r.staff_id)) {
+        username = staffNameById.get(r.staff_id)!;
+        if (!createdBy || /^[0-9a-f-]{16,}$/i.test(createdBy)) createdBy = username;
+      } else if (createdBy && staffNameById.has(createdBy)) {
+        username = staffNameById.get(createdBy)!;
+        createdBy = username;
+      }
+      const deviceName = r.device_name || '';
+      return {
+        id: r.id,
+        tenantId: r.tenant_id,
+        tenantSlug: r.tenant_slug,
+        staffId: r.staff_id,
+        type: r.type,
+        amount: Number(r.amount),
+        balanceAfter: Number(r.balance_after),
+        reason: r.reason,
+        refId: r.ref_id,
+        createdBy,
+        username,
+        user: username,
+        deviceName,
+        device: deviceName,
+        createdAt: r.created_at,
+        meta: {
+          createdBy,
+          username,
+          deviceName,
+          deviceLabel: deviceName,
+        },
+      };
+    }),
   });
 }
 
@@ -417,6 +492,7 @@ async function applyLedger(
     createdBy?: string;
     staffId?: string;
     refId?: string;
+    deviceName?: string;
   }
 ): Promise<number> {
   const now = new Date().toISOString();
@@ -427,22 +503,43 @@ async function applyLedger(
     db.prepare(
       `UPDATE tenant_wallets SET balance_credits = ?, updated_at = ?, warn_sent_at = CASE WHEN ? > low_balance_threshold THEN NULL ELSE warn_sent_at END WHERE tenant_id = ?`
     ).run(next, now, next, opts.tenantId);
-    db.prepare(
-      `INSERT INTO wallet_ledger (id, tenant_id, tenant_slug, staff_id, type, amount, balance_after, reason, ref_id, created_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      randomId(),
-      opts.tenantId,
-      opts.tenantSlug,
-      opts.staffId || null,
-      opts.type,
-      opts.amount,
-      next,
-      opts.reason || '',
-      opts.refId || null,
-      opts.createdBy || '',
-      now
-    );
+    // device_name may be missing on very old DBs before migrateToV13 — try with, fallback without
+    try {
+      db.prepare(
+        `INSERT INTO wallet_ledger (id, tenant_id, tenant_slug, staff_id, type, amount, balance_after, reason, ref_id, created_by, device_name, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        randomId(),
+        opts.tenantId,
+        opts.tenantSlug,
+        opts.staffId || null,
+        opts.type,
+        opts.amount,
+        next,
+        opts.reason || '',
+        opts.refId || null,
+        opts.createdBy || '',
+        opts.deviceName || '',
+        now
+      );
+    } catch {
+      db.prepare(
+        `INSERT INTO wallet_ledger (id, tenant_id, tenant_slug, staff_id, type, amount, balance_after, reason, ref_id, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        randomId(),
+        opts.tenantId,
+        opts.tenantSlug,
+        opts.staffId || null,
+        opts.type,
+        opts.amount,
+        next,
+        opts.reason || '',
+        opts.refId || null,
+        opts.createdBy || '',
+        now
+      );
+    }
     return next;
   });
   return tx();
@@ -503,7 +600,14 @@ export async function maybeRenewSubscriptionPeriod(tenantSlug: string): Promise<
 
 export async function consumeApiCredit(
   tenantSlug: string,
-  opts?: { staffId?: string; staffRole?: string; endpointId?: string; endpointName?: string }
+  opts?: {
+    staffId?: string;
+    staffRole?: string;
+    endpointId?: string;
+    endpointName?: string;
+    username?: string;
+    deviceName?: string;
+  }
 ): Promise<{
   ok: boolean;
   balance?: number;
@@ -550,6 +654,23 @@ export async function consumeApiCredit(
     };
   }
 
+  // Prefer human-readable username over raw staff id
+  let createdBy = (opts?.username && opts.username.trim()) || '';
+  if (!createdBy && opts?.staffId) {
+    try {
+      const st = db.prepare(`SELECT username, full_name FROM staff WHERE id = ?`).get(opts.staffId) as
+        | { username?: string; full_name?: string }
+        | undefined;
+      createdBy =
+        (st?.full_name && st.full_name.trim()) ||
+        (st?.username && st.username.trim()) ||
+        opts.staffId;
+    } catch {
+      createdBy = opts.staffId;
+    }
+  }
+  if (!createdBy) createdBy = 'api';
+
   const next = await applyLedger(db, {
     tenantId: tenant.id,
     tenantSlug: tenant.slug,
@@ -558,7 +679,8 @@ export async function consumeApiCredit(
     amount: -1,
     reason: opts?.endpointName ? `API: ${opts.endpointName}` : 'API call',
     refId: opts?.endpointId,
-    createdBy: opts?.staffId || 'api',
+    createdBy,
+    deviceName: opts?.deviceName || '',
   });
 
   return { ok: true, balance: next };
@@ -768,6 +890,8 @@ const ConsumeSchema = z.object({
   staffRole: z.string().optional(),
   endpointId: z.string().optional(),
   endpointName: z.string().optional(),
+  username: z.string().optional(),
+  deviceName: z.string().optional(),
 });
 
 /** POST /api/admin/billing/consume — BI dashboard proxy after successful widget query */
@@ -779,6 +903,8 @@ export async function consumeApiHttpHandler(req: FastifyRequest, reply: FastifyR
     staffRole: parsed.data.staffRole,
     endpointId: parsed.data.endpointId,
     endpointName: parsed.data.endpointName,
+    username: parsed.data.username,
+    deviceName: parsed.data.deviceName,
   });
   if (!r.ok) {
     return reply.code(402).send(r);

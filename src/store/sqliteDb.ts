@@ -175,6 +175,7 @@ function applySchema(db: Database.Database) {
   migrateToV10(db);
   migrateToV11(db);
   migrateToV12(db);
+  migrateToV13(db);
 }
 
 /** v2: edit locks (is_open) on tenants / staff / endpoints */
@@ -612,6 +613,7 @@ function migrateToV9(db: Database.Database) {
       reason TEXT DEFAULT '',
       ref_id TEXT,
       created_by TEXT DEFAULT '',
+      device_name TEXT DEFAULT '',
       created_at TEXT NOT NULL
     );
 
@@ -848,6 +850,28 @@ function migrateToV12(db: Database.Database) {
     `INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (12, datetime('now'))`
   ).run();
   console.log('✅ schema v12: device_assignments 1-firm-1-device unique + dedupe');
+}
+
+/** v13: wallet_ledger.device_name for Soňky hereketler Ulanyjy/Device columns */
+function migrateToV13(db: Database.Database) {
+  const ver = getSchemaVersion(db);
+  if (ver >= 13) return;
+
+  try {
+    const cols = (db.prepare(`PRAGMA table_info(wallet_ledger)`).all() as { name: string }[]).map(
+      (r) => r.name
+    );
+    if (!cols.includes('device_name')) {
+      db.exec(`ALTER TABLE wallet_ledger ADD COLUMN device_name TEXT DEFAULT ''`);
+    }
+  } catch (e) {
+    console.warn('[migrate v13] wallet_ledger.device_name failed', e);
+  }
+
+  db.prepare(
+    `INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (13, datetime('now'))`
+  ).run();
+  console.log('✅ schema v13: wallet_ledger.device_name');
 }
 
 // ---------------------------------------------------------------------------
