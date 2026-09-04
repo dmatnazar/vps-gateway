@@ -51,6 +51,14 @@ export async function catalogHandler(req: FastifyRequest, reply: FastifyReply) {
 
   // Return all tenants (active + passive) so admin UIs can show / reactivate them
   const tenantRows = db.prepare(`SELECT * FROM tenants`).all() as any[];
+  // Tell Electron which firms are assigned to this device. This is important when
+  // an Electron sync auto-created the assignment but the local device profile is stale.
+  const catalogDeviceId = String((req.headers['x-device-id'] || req.headers['X-Device-Id'] || '') || '');
+  const deviceTenantSlugs = catalogDeviceId
+    ? (db.prepare(`SELECT tenant_slug FROM device_assignments WHERE device_id = ?`).all(catalogDeviceId) as any[])
+        .map((r) => String(r.tenant_slug || '').trim())
+        .filter(Boolean)
+    : [];
   const connStmt = db.prepare(
     `SELECT * FROM tenant_connections WHERE tenant_id = ?`
   );
@@ -154,7 +162,7 @@ export async function catalogHandler(req: FastifyRequest, reply: FastifyReply) {
       isActive: Boolean(t.is_active),
       connections,
       connectionCount: connections.length,
-      staffCount: (staffCountStmt.get(t.slug, t.slug) as { c: number })?.c ?? 0,
+      staffCount: (staffCountStmt.get(t.slug) as { c: number })?.c ?? 0,
       endpointCount: (epCountStmt.get(t.slug) as { c: number })?.c ?? 0,
       deviceCount: (deviceCountStmt.get(t.slug, t.slug) as { c: number })?.c ?? 0,
       billing,
@@ -267,6 +275,8 @@ export async function catalogHandler(req: FastifyRequest, reply: FastifyReply) {
     staff,
     devices,
     deviceSettings,
+    // Device-scoped assignment list used by Electron to pull newly assigned companies.
+    deviceTenantSlugs,
     syncedAt: new Date().toISOString(),
   });
 }
@@ -607,18 +617,6 @@ export async function staffLookupHandler(req: FastifyRequest, reply: FastifyRepl
     hash.startsWith('pending-reset') ||
     hash.endsWith(':0000');
 
-  const userTenantSlugs: string[] = (() => {
-    try {
-      const parsed = JSON.parse(user.tenant_slugs || '[]');
-      return Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
-    } catch { return []; }
-  })();
-  const userTenantIds = userTenantSlugs
-    .map((slug) => tenantRepository.findBySlug(slug))
-    .map(async (p) => (await p)?.id)
-    ;
-  const resolvedTenantIds = (await Promise.all(userTenantIds)).filter(Boolean);
-
   return reply.send({
     id: user.id,
     username: user.username,
@@ -627,8 +625,7 @@ export async function staffLookupHandler(req: FastifyRequest, reply: FastifyRepl
     passwordUsable: !isPlaceholder,
     role: user.role,
     tenantSlug: user.tenant_slug,
-    tenantSlugs: userTenantSlugs,
-    tenantIds: resolvedTenantIds,
+    tenantSlugs: JSON.parse(user.tenant_slugs || '[]'),
     tenantName: tenant?.name,
     tenantId: tenant?.id,
     phone: user.phone,
