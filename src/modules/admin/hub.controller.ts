@@ -62,8 +62,13 @@ export async function catalogHandler(req: FastifyRequest, reply: FastifyReply) {
   const connStmt = db.prepare(
     `SELECT * FROM tenant_connections WHERE tenant_id = ?`
   );
+  // Multi-tenant: count staff whose primary tenant matches OR tenant_slugs JSON lists this slug
   const staffCountStmt = db.prepare(
-    `SELECT COUNT(*) as c FROM staff WHERE tenant_slug = ? AND active = 1`
+    `SELECT COUNT(*) as c FROM staff
+     WHERE active = 1 AND (
+       tenant_slug = ?
+       OR tenant_slugs LIKE '%"' || ? || '"%'
+     )`
   );
   const epCountStmt = db.prepare(
     `SELECT COUNT(*) as c FROM endpoints WHERE tenant_slug = ?`
@@ -162,7 +167,7 @@ export async function catalogHandler(req: FastifyRequest, reply: FastifyReply) {
       isActive: Boolean(t.is_active),
       connections,
       connectionCount: connections.length,
-      staffCount: (staffCountStmt.get(t.slug) as { c: number })?.c ?? 0,
+      staffCount: (staffCountStmt.get(t.slug, t.slug) as { c: number })?.c ?? 0,
       endpointCount: (epCountStmt.get(t.slug) as { c: number })?.c ?? 0,
       deviceCount: (deviceCountStmt.get(t.slug, t.slug) as { c: number })?.c ?? 0,
       billing,
@@ -462,10 +467,14 @@ export async function syncStaffHandler(req: FastifyRequest, reply: FastifyReply)
     hash.startsWith('pending-reset') ||
     hash.endsWith(':0000');
 
+  // Primary-tenant filter (for optional replace cleanup only)
   const existingForTenant = db
     .prepare(`SELECT * FROM staff WHERE tenant_slug = ?`)
     .all(tenantSlug) as any[];
-  const byUsername = new Map(existingForTenant.map((s) => [s.username.toLowerCase(), s]));
+  // Multi-tenant: password / id must be resolved globally by username (staff may have
+  // tenant_slug = another company while tenant_slugs JSON still lists this one)
+  const allStaffRows = db.prepare(`SELECT * FROM staff`).all() as any[];
+  const byUsername = new Map(allStaffRows.map((s) => [String(s.username || '').toLowerCase(), s]));
 
   const upsertStmt = db.prepare(`
     INSERT INTO staff (id, tenant_slug, tenant_slugs, full_name, username, password_hash, password_enc, role, phone, email, active, created_at, updated_at)
@@ -609,7 +618,28 @@ export async function staffLookupHandler(req: FastifyRequest, reply: FastifyRepl
     });
   }
 
+  // Multi-tenant: merge tenant_slugs from all matching rows (legacy duplicates) + JSON field
+  const slugSet = new Set<string>();
+  for (const m of matches) {
+    if (m.tenant_slug) slugSet.add(String(m.tenant_slug));
+    try {
+      const arr = JSON.parse(m.tenant_slugs || '[]');
+      if (Array.isArray(arr)) for (const s of arr) if (s) slugSet.add(String(s));
+    } catch { /* */ }
+  }
+  if (user.tenant_slug) slugSet.add(String(user.tenant_slug));
+  const tenantSlugs = Array.from(slugSet);
+
   const tenant = await tenantRepository.findBySlug(user.tenant_slug);
+  // Resolve all tenant ids for multi-company staff (needed by BI SessionUser.tenantIds)
+  const tenantIds: string[] = [];
+  const tenantNames: string[] = [];
+  for (const slug of tenantSlugs) {
+    const t = await tenantRepository.findBySlug(slug);
+    if (t?.id) tenantIds.push(String(t.id));
+    if (t?.name) tenantNames.push(String(t.name));
+  }
+
   const hash = user.password_hash || '';
   const isPlaceholder =
     !hash ||
@@ -625,9 +655,10 @@ export async function staffLookupHandler(req: FastifyRequest, reply: FastifyRepl
     passwordUsable: !isPlaceholder,
     role: user.role,
     tenantSlug: user.tenant_slug,
-    tenantSlugs: JSON.parse(user.tenant_slugs || '[]'),
-    tenantName: tenant?.name,
-    tenantId: tenant?.id,
+    tenantSlugs,
+    tenantName: tenant?.name || tenantNames[0],
+    tenantId: tenant?.id || tenantIds[0],
+    tenantIds,
     phone: user.phone,
     email: user.email,
     active: Boolean(user.active),
@@ -1015,7 +1046,25 @@ export async function tenantUpdateHandler(req: FastifyRequest, reply: FastifyRep
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(id, parsed.data.slug, parsed.data.name, active, now, now);
     t = { id, slug: parsed.data.slug, name: parsed.data.name, is_active: active };
-    logSync('create', 'tenant', id, 'bi', { slug: parsed.data.slug, isActive: active });
+    // Electron created company via tenant-update → auto-link this device
+    const deviceId =
+      (req.headers['x-device-id'] as string | undefined) ||
+      (req.body as any)?.deviceId ||
+      undefined;
+    const assign = ensureDeviceAssignment(db, deviceId, parsed.data.slug);
+    if (!assign.ok && assign.error) {
+      return reply.code(409).send({
+        error: assign.error,
+        code: 'FIRM_ALREADY_ASSIGNED',
+        tenantId: id,
+      });
+    }
+    logSync('create', 'tenant', id, deviceId ? 'electron' : 'bi', {
+      slug: parsed.data.slug,
+      isActive: active,
+      deviceId,
+      deviceAssigned: Boolean(deviceId),
+    });
   } else {
     // Concurrency: if client sends expectedUpdatedAt and server is newer → conflict
     if (parsed.data.expectedUpdatedAt && t.updated_at) {
@@ -1818,6 +1867,61 @@ const TestQuerySchema = z.object({
   params: z.record(z.any()).optional(),
   timeoutMs: z.number().optional(),
 });
+
+
+const ListDatabasesSchema = z.object({
+  tenantSlug: z.string().min(1),
+  host: z.string().optional(),
+  port: z.number().optional(),
+  username: z.string().optional(),
+  password: z.string().optional(),
+  encrypt: z.boolean().optional(),
+  trustServerCertificate: z.boolean().optional(),
+  dbKey: z.string().optional(),
+  timeoutMs: z.number().optional(),
+});
+
+/** List MSSQL databases via Electron tunnel (saved conn or ad-hoc credentials). */
+export async function listDatabasesHandler(req: FastifyRequest, reply: FastifyReply) {
+  const parsed = ListDatabasesSchema.safeParse(req.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+
+  const d = parsed.data;
+  const { agentTunnelManager } = await import('../../core/tunnel/agentTunnelManager');
+
+  const result = await agentTunnelManager.executeRemoteQuery(d.tenantSlug, {
+    sqlQuery: "SELECT name FROM sys.databases WHERE state = 0 AND name NOT IN ('master','tempdb','model','msdb') ORDER BY name",
+    dbKey: d.dbKey || 'primary',
+    params: {},
+    timeoutMs: d.timeoutMs || 25_000,
+    // Ad-hoc connection (before save) — Electron uses these when provided
+    connection: d.host
+      ? {
+          host: d.host,
+          port: d.port || 1433,
+          username: d.username || '',
+          password: d.password || '',
+          encrypt: d.encrypt !== false,
+          trustServerCertificate: d.trustServerCertificate !== false,
+          database: 'master',
+        }
+      : undefined,
+  } as any);
+
+  if (!result.ok) {
+    return reply.code(502).send({
+      ok: false,
+      error: result.error || 'DB sanawy alynmady',
+    });
+  }
+
+  const rows = result.rows || [];
+  const databases = rows
+    .map((r: any) => String(r.name || r.NAME || Object.values(r)[0] || ''))
+    .filter(Boolean);
+
+  return reply.send({ ok: true, databases, rowCount: databases.length });
+}
 
 export async function testQueryHandler(req: FastifyRequest, reply: FastifyReply) {
   const parsed = TestQuerySchema.safeParse(req.body);

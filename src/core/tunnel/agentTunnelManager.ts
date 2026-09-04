@@ -6,6 +6,16 @@ export interface RemoteQueryPayload {
   params?: Record<string, unknown>;
   dbKey?: string;
   timeoutMs?: number;
+  /** Ad-hoc MSSQL connection (list DBs before connection is saved) */
+  connection?: {
+    host: string;
+    port?: number;
+    username: string;
+    password: string;
+    encrypt?: boolean;
+    trustServerCertificate?: boolean;
+    database?: string;
+  };
 }
 
 export interface RemoteQueryResult {
@@ -253,7 +263,7 @@ class AgentTunnelManager {
         tenantSlug,
       });
 
-      const message = {
+      const message: Record<string, unknown> = {
         type: 'EXECUTE_QUERY',
         requestId,
         tenantSlug,
@@ -261,6 +271,9 @@ class AgentTunnelManager {
         sqlQuery: payload.sqlQuery,
         params: payload.params || {},
       };
+      if (payload.connection) {
+        message.connection = payload.connection;
+      }
 
       try {
         conn.socket.send(JSON.stringify(message));

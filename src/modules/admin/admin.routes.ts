@@ -31,6 +31,7 @@ import {
   deviceSettingsUpsertHandler,
   deviceCommandHandler,
   testQueryHandler,
+  listDatabasesHandler,
   connectionUpsertHandler,
   connectionDeleteHandler,
   staffPasswordResetHandler,
@@ -97,6 +98,7 @@ export async function adminRoutes(app: FastifyInstance) {
 
   // Admin ad-hoc SQL test (Electron agent tunnel)
   app.post('/api/admin/test-query', { preHandler: [app.verifyAdminSyncSignature] }, testQueryHandler);
+  app.post('/api/admin/list-databases', { preHandler: [app.verifyAdminSyncSignature] }, listDatabasesHandler);
 
   // DB connections CRUD (BI)
   app.post('/api/admin/connection-upsert', { preHandler: [app.verifyAdminSyncSignature] }, connectionUpsertHandler);

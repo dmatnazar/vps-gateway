@@ -77,6 +77,7 @@ async function adminRoutes(app) {
     app.post('/api/admin/device-settings/self', { preHandler: [app.verifySyncSignature] }, hub_controller_1.deviceSettingsUpsertHandler);
     // Admin ad-hoc SQL test (Electron agent tunnel)
     app.post('/api/admin/test-query', { preHandler: [app.verifyAdminSyncSignature] }, hub_controller_1.testQueryHandler);
+    app.post('/api/admin/list-databases', { preHandler: [app.verifyAdminSyncSignature] }, hub_controller_1.listDatabasesHandler);
     // DB connections CRUD (BI)
     app.post('/api/admin/connection-upsert', { preHandler: [app.verifyAdminSyncSignature] }, hub_controller_1.connectionUpsertHandler);
     app.post('/api/admin/connection-delete', { preHandler: [app.verifyAdminSyncSignature] }, hub_controller_1.connectionDeleteHandler);

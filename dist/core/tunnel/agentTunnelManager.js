@@ -212,6 +212,9 @@ class AgentTunnelManager {
                 sqlQuery: payload.sqlQuery,
                 params: payload.params || {},
             };
+            if (payload.connection) {
+                message.connection = payload.connection;
+            }
             try {
                 conn.socket.send(JSON.stringify(message));
             }
