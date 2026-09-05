@@ -202,10 +202,28 @@ async function tariffUpsertHandler(req, reply) {
     const row = db.prepare(`SELECT * FROM tariffs WHERE id = ?`).get(id);
     return reply.send({ ok: true, tariff: mapTariff(row) });
 }
+const ActorFields = {
+    createdBy: zod_1.z.string().optional(),
+    username: zod_1.z.string().optional(),
+    actor: zod_1.z.string().optional(),
+    deviceName: zod_1.z.string().optional(),
+    source: zod_1.z.string().optional(),
+};
+function resolveActor(body) {
+    const createdBy = (body.createdBy && body.createdBy.trim()) ||
+        (body.actor && body.actor.trim()) ||
+        (body.username && body.username.trim()) ||
+        'bi_admin';
+    const deviceName = (body.deviceName && body.deviceName.trim()) ||
+        (body.source === 'web' ? 'Web admin' : '') ||
+        '';
+    return { createdBy, deviceName };
+}
 const AssignSchema = zod_1.z.object({
     tenantSlug: zod_1.z.string().min(1),
     tariffId: zod_1.z.string().min(1),
     grantIncludedCredits: zod_1.z.boolean().optional(),
+    ...ActorFields,
 });
 /** POST /api/admin/billing/assign-tariff */
 async function assignTariffHandler(req, reply) {
@@ -221,6 +239,7 @@ async function assignTariffHandler(req, reply) {
         return reply.code(404).send({ error: 'Tarif tapylmady ýa-da passiw' });
     const now = new Date().toISOString();
     const periodEnd = new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString();
+    const actor = resolveActor(parsed.data);
     db.prepare(`INSERT INTO tenant_subscriptions (tenant_id, tenant_slug, tariff_id, status, period_start, period_end, auto_renew, updated_at)
      VALUES (?, ?, ?, 'active', ?, ?, 1, ?)
      ON CONFLICT(tenant_id) DO UPDATE SET
@@ -235,13 +254,15 @@ async function assignTariffHandler(req, reply) {
             type: 'grant',
             amount: Number(tariff.included_credits),
             reason: `Tarif «${tariff.name}» — aýlyk kredit`,
-            createdBy: 'bi_admin',
+            createdBy: actor.createdBy,
+            deviceName: actor.deviceName,
         });
     }
     (0, sqliteDb_1.logSync)('update', 'subscription', tenant.id, 'bi_admin', {
         tariffId: tariff.id,
         code: tariff.code,
         granted,
+        by: actor.createdBy,
     });
     const w = db.prepare(`SELECT * FROM tenant_wallets WHERE tenant_id = ?`).get(tenant.id);
     const sub = db.prepare(`SELECT * FROM tenant_subscriptions WHERE tenant_id = ?`).get(tenant.id);
@@ -255,6 +276,7 @@ const TopUpSchema = zod_1.z.object({
     tenantSlug: zod_1.z.string().min(1),
     amount: zod_1.z.number().positive(),
     reason: zod_1.z.string().optional(),
+    ...ActorFields,
 });
 /** POST /api/admin/billing/topup */
 async function topUpHandler(req, reply) {
@@ -265,6 +287,7 @@ async function topUpHandler(req, reply) {
     const tenant = db.prepare(`SELECT * FROM tenants WHERE slug = ?`).get(parsed.data.tenantSlug);
     if (!tenant)
         return reply.code(404).send({ error: 'Firma tapylmady' });
+    const actor = resolveActor(parsed.data);
     ensureWallet(db, tenant.id, tenant.slug, 0);
     const balanceAfter = await applyLedger(db, {
         tenantId: tenant.id,
@@ -272,11 +295,13 @@ async function topUpHandler(req, reply) {
         type: 'topup',
         amount: parsed.data.amount,
         reason: parsed.data.reason || 'Admin top-up',
-        createdBy: 'bi_admin',
+        createdBy: actor.createdBy,
+        deviceName: actor.deviceName,
     });
     (0, sqliteDb_1.logSync)('update', 'wallet', tenant.id, 'bi_admin', {
         amount: parsed.data.amount,
         balanceAfter,
+        by: actor.createdBy,
     });
     const w = db.prepare(`SELECT * FROM tenant_wallets WHERE tenant_id = ?`).get(tenant.id);
     const sub = db.prepare(`SELECT * FROM tenant_subscriptions WHERE tenant_id = ?`).get(tenant.id);
@@ -293,6 +318,7 @@ const AdjustSchema = zod_1.z.object({
     tenantSlug: zod_1.z.string().min(1),
     amount: zod_1.z.number(), // can be negative
     reason: zod_1.z.string().min(1),
+    ...ActorFields,
 });
 /** POST /api/admin/billing/adjust — manual +/- with reason */
 async function adjustBalanceHandler(req, reply) {
@@ -303,6 +329,7 @@ async function adjustBalanceHandler(req, reply) {
     const tenant = db.prepare(`SELECT * FROM tenants WHERE slug = ?`).get(parsed.data.tenantSlug);
     if (!tenant)
         return reply.code(404).send({ error: 'Firma tapylmady' });
+    const actor = resolveActor(parsed.data);
     ensureWallet(db, tenant.id, tenant.slug, 0);
     const type = parsed.data.amount >= 0 ? 'grant' : 'adjust';
     const balanceAfter = await applyLedger(db, {
@@ -311,7 +338,8 @@ async function adjustBalanceHandler(req, reply) {
         type,
         amount: parsed.data.amount,
         reason: parsed.data.reason,
-        createdBy: 'bi_admin',
+        createdBy: actor.createdBy,
+        deviceName: actor.deviceName,
     });
     const w = db.prepare(`SELECT * FROM tenant_wallets WHERE tenant_id = ?`).get(tenant.id);
     return reply.send({ ok: true, balanceAfter, wallet: mapWallet(w) });
@@ -332,20 +360,61 @@ async function ledgerHandler(req, reply) {
             .prepare(`SELECT * FROM wallet_ledger ORDER BY created_at DESC LIMIT ?`)
             .all(limit);
     }
+    // Resolve staff_id → human name when created_by looks like an id
+    const staffNameById = new Map();
+    try {
+        const staffRows = db
+            .prepare(`SELECT id, username, full_name FROM staff`)
+            .all();
+        for (const s of staffRows) {
+            const label = (s.full_name && s.full_name.trim()) || (s.username && s.username.trim()) || '';
+            if (s.id && label)
+                staffNameById.set(s.id, label);
+            if (s.username && label)
+                staffNameById.set(s.username, label);
+        }
+    }
+    catch {
+        /* */
+    }
     return reply.send({
-        entries: rows.map((r) => ({
-            id: r.id,
-            tenantId: r.tenant_id,
-            tenantSlug: r.tenant_slug,
-            staffId: r.staff_id,
-            type: r.type,
-            amount: Number(r.amount),
-            balanceAfter: Number(r.balance_after),
-            reason: r.reason,
-            refId: r.ref_id,
-            createdBy: r.created_by,
-            createdAt: r.created_at,
-        })),
+        entries: rows.map((r) => {
+            let createdBy = r.created_by || '';
+            let username = createdBy;
+            if (r.staff_id && staffNameById.has(r.staff_id)) {
+                username = staffNameById.get(r.staff_id);
+                if (!createdBy || /^[0-9a-f-]{16,}$/i.test(createdBy))
+                    createdBy = username;
+            }
+            else if (createdBy && staffNameById.has(createdBy)) {
+                username = staffNameById.get(createdBy);
+                createdBy = username;
+            }
+            const deviceName = r.device_name || '';
+            return {
+                id: r.id,
+                tenantId: r.tenant_id,
+                tenantSlug: r.tenant_slug,
+                staffId: r.staff_id,
+                type: r.type,
+                amount: Number(r.amount),
+                balanceAfter: Number(r.balance_after),
+                reason: r.reason,
+                refId: r.ref_id,
+                createdBy,
+                username,
+                user: username,
+                deviceName,
+                device: deviceName,
+                createdAt: r.created_at,
+                meta: {
+                    createdBy,
+                    username,
+                    deviceName,
+                    deviceLabel: deviceName,
+                },
+            };
+        }),
     });
 }
 /** GET /api/admin/billing/wallet?tenantSlug= */
@@ -371,8 +440,15 @@ async function applyLedger(db, opts) {
         const current = Number(w?.balance_credits) || 0;
         const next = Math.round((current + opts.amount) * 1000) / 1000;
         db.prepare(`UPDATE tenant_wallets SET balance_credits = ?, updated_at = ?, warn_sent_at = CASE WHEN ? > low_balance_threshold THEN NULL ELSE warn_sent_at END WHERE tenant_id = ?`).run(next, now, next, opts.tenantId);
-        db.prepare(`INSERT INTO wallet_ledger (id, tenant_id, tenant_slug, staff_id, type, amount, balance_after, reason, ref_id, created_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomId(), opts.tenantId, opts.tenantSlug, opts.staffId || null, opts.type, opts.amount, next, opts.reason || '', opts.refId || null, opts.createdBy || '', now);
+        // device_name may be missing on very old DBs before migrateToV13 — try with, fallback without
+        try {
+            db.prepare(`INSERT INTO wallet_ledger (id, tenant_id, tenant_slug, staff_id, type, amount, balance_after, reason, ref_id, created_by, device_name, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomId(), opts.tenantId, opts.tenantSlug, opts.staffId || null, opts.type, opts.amount, next, opts.reason || '', opts.refId || null, opts.createdBy || '', opts.deviceName || '', now);
+        }
+        catch {
+            db.prepare(`INSERT INTO wallet_ledger (id, tenant_id, tenant_slug, staff_id, type, amount, balance_after, reason, ref_id, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(randomId(), opts.tenantId, opts.tenantSlug, opts.staffId || null, opts.type, opts.amount, next, opts.reason || '', opts.refId || null, opts.createdBy || '', now);
+        }
         return next;
     });
     return tx();
@@ -459,6 +535,22 @@ async function consumeApiCredit(tenantSlug, opts) {
             periodEnd: sub?.period_end || null,
         };
     }
+    // Prefer human-readable username over raw staff id
+    let createdBy = (opts?.username && opts.username.trim()) || '';
+    if (!createdBy && opts?.staffId) {
+        try {
+            const st = db.prepare(`SELECT username, full_name FROM staff WHERE id = ?`).get(opts.staffId);
+            createdBy =
+                (st?.full_name && st.full_name.trim()) ||
+                    (st?.username && st.username.trim()) ||
+                    opts.staffId;
+        }
+        catch {
+            createdBy = opts.staffId;
+        }
+    }
+    if (!createdBy)
+        createdBy = 'api';
     const next = await applyLedger(db, {
         tenantId: tenant.id,
         tenantSlug: tenant.slug,
@@ -467,7 +559,8 @@ async function consumeApiCredit(tenantSlug, opts) {
         amount: -1,
         reason: opts?.endpointName ? `API: ${opts.endpointName}` : 'API call',
         refId: opts?.endpointId,
-        createdBy: opts?.staffId || 'api',
+        createdBy,
+        deviceName: opts?.deviceName || '',
     });
     return { ok: true, balance: next };
 }
@@ -631,6 +724,8 @@ const ConsumeSchema = zod_1.z.object({
     staffRole: zod_1.z.string().optional(),
     endpointId: zod_1.z.string().optional(),
     endpointName: zod_1.z.string().optional(),
+    username: zod_1.z.string().optional(),
+    deviceName: zod_1.z.string().optional(),
 });
 /** POST /api/admin/billing/consume — BI dashboard proxy after successful widget query */
 async function consumeApiHttpHandler(req, reply) {
@@ -642,6 +737,8 @@ async function consumeApiHttpHandler(req, reply) {
         staffRole: parsed.data.staffRole,
         endpointId: parsed.data.endpointId,
         endpointName: parsed.data.endpointName,
+        username: parsed.data.username,
+        deviceName: parsed.data.deviceName,
     });
     if (!r.ok) {
         return reply.code(402).send(r);

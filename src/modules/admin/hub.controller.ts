@@ -2734,7 +2734,27 @@ export async function deleteDeviceHandler(req: FastifyRequest, reply: FastifyRep
     status: 'deleted',
   });
 
-  db.prepare(`DELETE FROM devices WHERE id = ?`).run(params.id);
+  const tx = db.transaction(() => {
+    // Previously only `devices` was deleted, leaving orphaned rows in these
+    // tables (still referencing the now-gone device_id). Once the v12
+    // "1 firm = 1 device" unique index is enforced, an orphaned
+    // device_assignments row keeps that tenant_slug locked forever, blocking
+    // re-assignment to a real device. Clean up everything tied to this device.
+    db.prepare(`DELETE FROM device_assignments WHERE device_id = ?`).run(params.id);
+    try {
+      db.prepare(`DELETE FROM device_settings WHERE device_id = ?`).run(params.id);
+    } catch {
+      /* table may not exist on very old DBs */
+    }
+    try {
+      db.prepare(`DELETE FROM device_app_settings WHERE device_id = ?`).run(params.id);
+    } catch {
+      /* table may not exist on very old DBs */
+    }
+    db.prepare(`DELETE FROM devices WHERE id = ?`).run(params.id);
+  });
+  tx();
+
   logSync('delete', 'device', params.id, 'bi_admin', { hostname: device.hostname });
 
   return reply.send({ ok: true, deleted: true, id: params.id });

@@ -2210,7 +2210,15 @@ async function approveDeviceHandler(req, reply) {
     if (!device)
         return reply.code(404).send({ error: 'Device not found' });
     const primaryTenant = tenants[0];
-    db.prepare(`DELETE FROM device_assignments WHERE device_id = ?`).run(params.id);
+    // NOTE: previously this did `DELETE FROM device_assignments WHERE device_id = ?`
+    // unconditionally, wiping out ALL firms already linked to this device before
+    // re-inserting only the slugs sent in *this* request. If the admin/BI approved
+    // firms one at a time (e.g. approve "A" today, approve "B" next week without
+    // re-sending "A"), the previously assigned firm(s) silently disappeared and
+    // only the most recently approved firm remained. claimTenantAssignments()
+    // below already handles per-slug conflict resolution (stealing a slug from
+    // another device) without touching this device's other, unrelated slugs —
+    // so we no longer need (or want) a blanket delete here.
     const cols = (table) => db.prepare(`PRAGMA table_info(${table})`).all().map((r) => r.name);
     const hasSyncSecretCol = cols('devices').includes('device_sync_secret');
     const deviceSyncSecret = hasSyncSecretCol
