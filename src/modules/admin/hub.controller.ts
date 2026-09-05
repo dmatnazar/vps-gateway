@@ -428,6 +428,8 @@ export async function createTenantHandler(req: FastifyRequest, reply: FastifyRep
 
 const StaffSyncSchema = z.object({
   tenantSlug: z.string().min(1),
+  /** When true, tenantSlugs on each staff row is treated as the full desired list (BI admin). */
+  authoritative: z.boolean().optional(),
   staff: z.array(
     z.object({
       id: z.string().min(1),
@@ -436,6 +438,8 @@ const StaffSyncSchema = z.object({
       passwordHash: z.string().min(1),
       role: z.enum(['admin', 'editor', 'manager', 'viewer']),
       tenantSlugs: z.array(z.string()).optional(),
+      /** Per-row override: treat tenantSlugs as full desired set. */
+      authoritative: z.boolean().optional(),
       phone: z.string().optional(),
       email: z.string().optional(),
       active: z.boolean().default(true),
@@ -509,10 +513,40 @@ export async function syncStaffHandler(req: FastifyRequest, reply: FastifyReply)
         ? encryptPasswordPlain((s as any).passwordPlain)
         : (s as any).passwordEnc || prev?.password_enc || '';
 
+      // Multi-tenant protection:
+      // Electron / partial sync often sends only the current company (or omits tenantSlugs).
+      // Never collapse an existing multi-firm assignment down to a single firm.
+      // Only expand (union) unless the payload explicitly marks authoritative=true
+      // (BI admin full replace of the firm list).
+      const prevSlugs: string[] = (() => {
+        try {
+          const raw = JSON.parse(prev?.tenant_slugs || '[]');
+          if (Array.isArray(raw) && raw.length) return raw.map(String).filter(Boolean);
+        } catch { /* */ }
+        return prev?.tenant_slug ? [String(prev.tenant_slug)] : [];
+      })();
+      const incomingSlugs: string[] = Array.isArray(s.tenantSlugs) && s.tenantSlugs.length
+        ? s.tenantSlugs.map(String).filter(Boolean)
+        : [tenantSlug];
+      const authoritative = Boolean((s as any).authoritative === true || (parsed.data as any).authoritative === true);
+      let finalSlugs: string[];
+      if (authoritative) {
+        // BI admin: trust the exact desired list, still keep the tenant being synced.
+        finalSlugs = Array.from(new Set([...incomingSlugs, tenantSlug]));
+      } else {
+        // Device / partial sync: only ADD firms, never remove existing multi-tenant links.
+        finalSlugs = Array.from(new Set([...prevSlugs, ...incomingSlugs, tenantSlug]));
+      }
+      // Keep primary tenant_slug stable when still valid; otherwise use syncing tenant.
+      const primarySlug =
+        prev?.tenant_slug && finalSlugs.includes(String(prev.tenant_slug))
+          ? String(prev.tenant_slug)
+          : tenantSlug;
+
       upsertStmt.run({
         id: prev?.id || s.id,
-        tenantSlug,
-        tenantSlugs: JSON.stringify(s.tenantSlugs?.length ? s.tenantSlugs : [tenantSlug]),
+        tenantSlug: primarySlug,
+        tenantSlugs: JSON.stringify(finalSlugs),
         fullName: s.fullName,
         username: s.username,
         passwordHash,

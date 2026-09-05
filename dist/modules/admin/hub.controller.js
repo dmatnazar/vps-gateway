@@ -456,6 +456,8 @@ async function createTenantHandler(req, reply) {
 // ── Staff sync ───────────────────────────────────────────────
 const StaffSyncSchema = zod_1.z.object({
     tenantSlug: zod_1.z.string().min(1),
+    /** When true, tenantSlugs on each staff row is treated as the full desired list (BI admin). */
+    authoritative: zod_1.z.boolean().optional(),
     staff: zod_1.z.array(zod_1.z.object({
         id: zod_1.z.string().min(1),
         fullName: zod_1.z.string().min(1),
@@ -463,6 +465,8 @@ const StaffSyncSchema = zod_1.z.object({
         passwordHash: zod_1.z.string().min(1),
         role: zod_1.z.enum(['admin', 'editor', 'manager', 'viewer']),
         tenantSlugs: zod_1.z.array(zod_1.z.string()).optional(),
+        /** Per-row override: treat tenantSlugs as full desired set. */
+        authoritative: zod_1.z.boolean().optional(),
         phone: zod_1.z.string().optional(),
         email: zod_1.z.string().optional(),
         active: zod_1.z.boolean().default(true),
@@ -522,10 +526,41 @@ async function syncStaffHandler(req, reply) {
             const passwordEnc = s.passwordPlain
                 ? (0, passwordEnc_1.encryptPasswordPlain)(s.passwordPlain)
                 : s.passwordEnc || prev?.password_enc || '';
+            // Multi-tenant protection:
+            // Electron / partial sync often sends only the current company (or omits tenantSlugs).
+            // Never collapse an existing multi-firm assignment down to a single firm.
+            // Only expand (union) unless the payload explicitly marks authoritative=true
+            // (BI admin full replace of the firm list).
+            const prevSlugs = (() => {
+                try {
+                    const raw = JSON.parse(prev?.tenant_slugs || '[]');
+                    if (Array.isArray(raw) && raw.length)
+                        return raw.map(String).filter(Boolean);
+                }
+                catch { /* */ }
+                return prev?.tenant_slug ? [String(prev.tenant_slug)] : [];
+            })();
+            const incomingSlugs = Array.isArray(s.tenantSlugs) && s.tenantSlugs.length
+                ? s.tenantSlugs.map(String).filter(Boolean)
+                : [tenantSlug];
+            const authoritative = Boolean(s.authoritative === true || parsed.data.authoritative === true);
+            let finalSlugs;
+            if (authoritative) {
+                // BI admin: trust the exact desired list, still keep the tenant being synced.
+                finalSlugs = Array.from(new Set([...incomingSlugs, tenantSlug]));
+            }
+            else {
+                // Device / partial sync: only ADD firms, never remove existing multi-tenant links.
+                finalSlugs = Array.from(new Set([...prevSlugs, ...incomingSlugs, tenantSlug]));
+            }
+            // Keep primary tenant_slug stable when still valid; otherwise use syncing tenant.
+            const primarySlug = prev?.tenant_slug && finalSlugs.includes(String(prev.tenant_slug))
+                ? String(prev.tenant_slug)
+                : tenantSlug;
             upsertStmt.run({
                 id: prev?.id || s.id,
-                tenantSlug,
-                tenantSlugs: JSON.stringify(s.tenantSlugs?.length ? s.tenantSlugs : [tenantSlug]),
+                tenantSlug: primarySlug,
+                tenantSlugs: JSON.stringify(finalSlugs),
                 fullName: s.fullName,
                 username: s.username,
                 passwordHash,
@@ -2346,7 +2381,28 @@ async function deleteDeviceHandler(req, reply) {
         deviceId: params.id,
         status: 'deleted',
     });
-    db.prepare(`DELETE FROM devices WHERE id = ?`).run(params.id);
+    const tx = db.transaction(() => {
+        // Previously only `devices` was deleted, leaving orphaned rows in these
+        // tables (still referencing the now-gone device_id). Once the v12
+        // "1 firm = 1 device" unique index is enforced, an orphaned
+        // device_assignments row keeps that tenant_slug locked forever, blocking
+        // re-assignment to a real device. Clean up everything tied to this device.
+        db.prepare(`DELETE FROM device_assignments WHERE device_id = ?`).run(params.id);
+        try {
+            db.prepare(`DELETE FROM device_settings WHERE device_id = ?`).run(params.id);
+        }
+        catch {
+            /* table may not exist on very old DBs */
+        }
+        try {
+            db.prepare(`DELETE FROM device_app_settings WHERE device_id = ?`).run(params.id);
+        }
+        catch {
+            /* table may not exist on very old DBs */
+        }
+        db.prepare(`DELETE FROM devices WHERE id = ?`).run(params.id);
+    });
+    tx();
     (0, sqliteDb_1.logSync)('delete', 'device', params.id, 'bi_admin', { hostname: device.hostname });
     return reply.send({ ok: true, deleted: true, id: params.id });
 }
