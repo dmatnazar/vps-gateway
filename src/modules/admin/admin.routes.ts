@@ -49,6 +49,8 @@ import {
   requestTariffChangeHandler,
   listTariffRequestsHandler,
   resolveTariffRequestHandler,
+  deleteLedgerHandler,
+  deleteLedgerBulkHandler,
 } from './billing.controller';
 
 import { routeRegistry } from '../../core/router/routeRegistry';
@@ -117,6 +119,8 @@ export async function adminRoutes(app: FastifyInstance) {
   app.post('/api/admin/billing/topup', { preHandler: [app.verifyAdminSyncSignature] }, topUpHandler);
   app.post('/api/admin/billing/adjust', { preHandler: [app.verifyAdminSyncSignature] }, adjustBalanceHandler);
   app.get('/api/admin/billing/ledger', { preHandler: [app.verifyAdminSyncSignature] }, ledgerHandler);
+  app.delete('/api/admin/billing/ledger/:id', { preHandler: [app.verifyAdminSyncSignature] }, deleteLedgerHandler);
+  app.post('/api/admin/billing/ledger/delete', { preHandler: [app.verifyAdminSyncSignature] }, deleteLedgerBulkHandler);
   app.post('/api/admin/billing/consume', { preHandler: [app.verifyAdminSyncSignature] }, consumeApiHttpHandler);
   app.get('/api/admin/billing/wallet', { preHandler: [app.verifyAdminSyncSignature] }, walletGetHandler);
   // Device/Electron can read own wallet (optional)

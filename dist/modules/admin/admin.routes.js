@@ -93,6 +93,8 @@ async function adminRoutes(app) {
     app.post('/api/admin/billing/topup', { preHandler: [app.verifyAdminSyncSignature] }, billing_controller_1.topUpHandler);
     app.post('/api/admin/billing/adjust', { preHandler: [app.verifyAdminSyncSignature] }, billing_controller_1.adjustBalanceHandler);
     app.get('/api/admin/billing/ledger', { preHandler: [app.verifyAdminSyncSignature] }, billing_controller_1.ledgerHandler);
+    app.delete('/api/admin/billing/ledger/:id', { preHandler: [app.verifyAdminSyncSignature] }, billing_controller_1.deleteLedgerHandler);
+    app.post('/api/admin/billing/ledger/delete', { preHandler: [app.verifyAdminSyncSignature] }, billing_controller_1.deleteLedgerBulkHandler);
     app.post('/api/admin/billing/consume', { preHandler: [app.verifyAdminSyncSignature] }, billing_controller_1.consumeApiHttpHandler);
     app.get('/api/admin/billing/wallet', { preHandler: [app.verifyAdminSyncSignature] }, billing_controller_1.walletGetHandler);
     // Device/Electron can read own wallet (optional)

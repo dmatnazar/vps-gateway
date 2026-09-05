@@ -395,22 +395,27 @@ export async function adjustBalanceHandler(req: FastifyRequest, reply: FastifyRe
   return reply.send({ ok: true, balanceAfter, wallet: mapWallet(w) });
 }
 
-/** GET /api/admin/billing/ledger?tenantSlug=&limit= */
+/** GET /api/admin/billing/ledger?tenantSlug=&limit=&offset= */
 export async function ledgerHandler(req: FastifyRequest, reply: FastifyReply) {
-  const q = req.query as { tenantSlug?: string; limit?: string };
+  const q = req.query as { tenantSlug?: string; limit?: string; offset?: string };
   const db = getDb();
-  const limit = Math.min(Number(q.limit) || 50, 200);
+  // Allow large admin history views (BI "Ähli hereketler" + page-size control)
+  const limit = Math.min(Math.max(Number(q.limit) || 50, 1), 5000);
+  const offset = Math.max(Number(q.offset) || 0, 0);
   let rows: any[];
+  let total = 0;
   if (q.tenantSlug) {
+    total = (db.prepare(`SELECT COUNT(*) as c FROM wallet_ledger WHERE tenant_slug = ?`).get(q.tenantSlug) as any)?.c || 0;
     rows = db
       .prepare(
-        `SELECT * FROM wallet_ledger WHERE tenant_slug = ? ORDER BY created_at DESC LIMIT ?`
+        `SELECT * FROM wallet_ledger WHERE tenant_slug = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`
       )
-      .all(q.tenantSlug, limit) as any[];
+      .all(q.tenantSlug, limit, offset) as any[];
   } else {
+    total = (db.prepare(`SELECT COUNT(*) as c FROM wallet_ledger`).get() as any)?.c || 0;
     rows = db
-      .prepare(`SELECT * FROM wallet_ledger ORDER BY created_at DESC LIMIT ?`)
-      .all(limit) as any[];
+      .prepare(`SELECT * FROM wallet_ledger ORDER BY created_at DESC LIMIT ? OFFSET ?`)
+      .all(limit, offset) as any[];
   }
   // Resolve staff_id → human name when created_by looks like an id
   const staffNameById = new Map<string, string>();
@@ -428,6 +433,9 @@ export async function ledgerHandler(req: FastifyRequest, reply: FastifyReply) {
   }
 
   return reply.send({
+    total,
+    limit,
+    offset,
     entries: rows.map((r) => {
       let createdBy = r.created_by || '';
       let username = createdBy;
@@ -496,20 +504,39 @@ async function applyLedger(
   }
 ): Promise<number> {
   const now = new Date().toISOString();
+  // Ensure device_name column exists (older DBs) so INSERT never silently skips ledger rows
+  try {
+    const cols = (db.prepare(`PRAGMA table_info(wallet_ledger)`).all() as { name: string }[]).map((c) => c.name);
+    if (!cols.includes('device_name')) {
+      db.exec(`ALTER TABLE wallet_ledger ADD COLUMN device_name TEXT DEFAULT ''`);
+    }
+  } catch {
+    /* ignore */
+  }
+
   const tx = db.transaction(() => {
     const w = db.prepare(`SELECT * FROM tenant_wallets WHERE tenant_id = ?`).get(opts.tenantId) as any;
-    const current = Number(w?.balance_credits) || 0;
+    if (!w) {
+      // Wallet missing mid-tx — create then continue
+      db.prepare(
+        `INSERT OR IGNORE INTO tenant_wallets (tenant_id, tenant_slug, balance_credits, low_balance_threshold, updated_at)
+         VALUES (?, ?, 0, 50, ?)`
+      ).run(opts.tenantId, opts.tenantSlug, now);
+    }
+    const w2 = db.prepare(`SELECT * FROM tenant_wallets WHERE tenant_id = ?`).get(opts.tenantId) as any;
+    const current = Number(w2?.balance_credits) || 0;
     const next = Math.round((current + opts.amount) * 1000) / 1000;
     db.prepare(
       `UPDATE tenant_wallets SET balance_credits = ?, updated_at = ?, warn_sent_at = CASE WHEN ? > low_balance_threshold THEN NULL ELSE warn_sent_at END WHERE tenant_id = ?`
     ).run(next, now, next, opts.tenantId);
-    // device_name may be missing on very old DBs before migrateToV13 — try with, fallback without
+
+    const ledgerId = randomId();
     try {
       db.prepare(
         `INSERT INTO wallet_ledger (id, tenant_id, tenant_slug, staff_id, type, amount, balance_after, reason, ref_id, created_by, device_name, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
-        randomId(),
+        ledgerId,
         opts.tenantId,
         opts.tenantSlug,
         opts.staffId || null,
@@ -522,23 +549,29 @@ async function applyLedger(
         opts.deviceName || '',
         now
       );
-    } catch {
-      db.prepare(
-        `INSERT INTO wallet_ledger (id, tenant_id, tenant_slug, staff_id, type, amount, balance_after, reason, ref_id, created_by, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        randomId(),
-        opts.tenantId,
-        opts.tenantSlug,
-        opts.staffId || null,
-        opts.type,
-        opts.amount,
-        next,
-        opts.reason || '',
-        opts.refId || null,
-        opts.createdBy || '',
-        now
-      );
+    } catch (e1) {
+      // Fallback without device_name for very old schemas
+      try {
+        db.prepare(
+          `INSERT INTO wallet_ledger (id, tenant_id, tenant_slug, staff_id, type, amount, balance_after, reason, ref_id, created_by, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          ledgerId,
+          opts.tenantId,
+          opts.tenantSlug,
+          opts.staffId || null,
+          opts.type,
+          opts.amount,
+          next,
+          opts.reason || '',
+          opts.refId || null,
+          opts.createdBy || '',
+          now
+        );
+      } catch (e2) {
+        // Re-throw so balance update rolls back — never credit without a ledger row
+        throw e2;
+      }
     }
     return next;
   });
@@ -910,4 +943,35 @@ export async function consumeApiHttpHandler(req: FastifyRequest, reply: FastifyR
     return reply.code(402).send(r);
   }
   return reply.send({ ...r, ok: true });
+}
+
+
+/** DELETE /api/admin/billing/ledger/:id */
+export async function deleteLedgerHandler(req: FastifyRequest, reply: FastifyReply) {
+  const id = (req.params as { id?: string })?.id;
+  if (!id) return reply.code(400).send({ error: 'id gerek' });
+  const db = getDb();
+  const row = db.prepare(`SELECT id FROM wallet_ledger WHERE id = ?`).get(id);
+  if (!row) return reply.code(404).send({ error: 'Log tapylmady' });
+  db.prepare(`DELETE FROM wallet_ledger WHERE id = ?`).run(id);
+  return reply.send({ ok: true, deleted: 1, id });
+}
+
+/** POST /api/admin/billing/ledger/delete { ids: string[] } */
+export async function deleteLedgerBulkHandler(req: FastifyRequest, reply: FastifyReply) {
+  const body = (req.body || {}) as { ids?: string[] };
+  const ids = Array.isArray(body.ids) ? body.ids.map(String).filter(Boolean) : [];
+  if (!ids.length) return reply.code(400).send({ error: 'ids gerek' });
+  const db = getDb();
+  const del = db.prepare(`DELETE FROM wallet_ledger WHERE id = ?`);
+  const tx = db.transaction((list: string[]) => {
+    let n = 0;
+    for (const id of list) {
+      const info = del.run(id);
+      n += info.changes || 0;
+    }
+    return n;
+  });
+  const deleted = tx(ids);
+  return reply.send({ ok: true, deleted, ids });
 }
